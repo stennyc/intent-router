@@ -135,10 +135,13 @@ _SESSION_TTL = 3600       # session 状态寿命（秒）
 _SESSIONS_MAX = 256       # LRU 上限
 _RUNNING_TTL = 1800       # running 标志兜底过期（秒）—— 完成消息丢失时防永久卡死
 
-# 宿主 async-delegation 完成消息的重入标记（tools/process_registry_notifications.py:
-# _format_async_delegation → "[ASYNC DELEGATION COMPLETE — <delegation_id>]"）
-_COMPLETION_MARKER = "[ASYNC DELEGATION COMPLETE"
-_COMPLETION_ID_RE = re.compile(r"\[ASYNC DELEGATION COMPLETE[^\]]*?([A-Za-z0-9_\-]+)\]")
+# 宿主 async-delegation 完成消息的重入标记。两种形态（live probe 2026-11-16 实证）:
+#   单任务:   "[ASYNC DELEGATION COMPLETE — <delegation_id>]"   (_format_async_delegation)
+#   批量/fan-out: "[ASYNC DELEGATION BATCH COMPLETE — <delegation_id>]"  (实际交付形态，
+#   即便 tasks 只有 1 条也按 fan-out unit 交付 —— 活体探针 deleg_21ecff95 证实)
+# 公共前缀 "[ASYNC DELEGATION " 匹配两种；id 正则兼容 BATCH 变体。
+_COMPLETION_MARKER = "[ASYNC DELEGATION "
+_COMPLETION_ID_RE = re.compile(r"\[ASYNC DELEGATION (?:BATCH )?COMPLETE[^\]]*?([A-Za-z0-9_\-]+)\]")
 
 
 class _SessionState:

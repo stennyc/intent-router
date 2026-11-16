@@ -90,10 +90,12 @@ def _turn(env, user, first, history=None, session_id="s1"):
     )
 
 
-def _completion_msg(deleg_id):
-    """The exact host re-entry shape (tools/process_registry_notifications.py: _format_async_delegation)."""
+def _completion_msg(deleg_id, batch=True):
+    """Exact host re-entry shapes (live probe deleg_21ecff95, 2026-11-16: batch/fan-out form
+    is what even a 1-task dispatch delivers; single-task form per _format_async_delegation)."""
+    marker = "[ASYNC DELEGATION BATCH COMPLETE — " if batch else "[ASYNC DELEGATION COMPLETE — "
     return (
-        f"[ASYNC DELEGATION COMPLETE — {deleg_id}]\n"
+        f"{marker}{deleg_id}]\n"
         "A background subagent you dispatched earlier has finished.\n"
         "Status: completed   API calls: 2   Duration: 41s\n"
         "--- RESULT ---\n"
@@ -218,6 +220,21 @@ def test_completion_reentry_clears_running_and_skips_detection(env):
     assert r is None
     assert len(env.ctx.llm.calls) == calls_before            # no classification on synthetic turns (loop guard)
     assert env.mod._SESSIONS["s1"].running == {}             # running flag cleared by id
+
+
+def test_completion_reentry_single_task_form_also_guarded(env):
+    """单任务形态 '[ASYNC DELEGATION COMPLETE — ...]'（_format_async_delegation）同样被守卫。"""
+    env.ctx.llm.scripts = [
+        {"category": "engineering", "confidence": 0.9},
+        {"category": "security", "confidence": 0.9},
+    ]
+    _turn(env, "帮我写个 REST 后端 API", first=True)
+    _turn(env, "查一下注入", first=False)
+    calls_before = len(env.ctx.llm.calls)
+    r = _turn(env, _completion_msg("deleg_0001", batch=False), first=False)
+    assert r is None
+    assert len(env.ctx.llm.calls) == calls_before
+    assert env.mod._SESSIONS["s1"].running == {}
 
 
 def test_redispatch_allowed_after_completion(env):
