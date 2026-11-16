@@ -109,7 +109,9 @@ owner 裁决：
 
 蒸馏卡（`cards/<slug>.md`）：离线静态资产进 git，**带判断标准不带模板**（模板/细节只留"取全文"指针）。
 13 个大专家（6.5–24KB）出卡；15 个小专家（≤1.1KB）不出卡——补注走全文回退（本来就便宜）。
-样例卡：`cards/product-product-manager.md`、`cards/engineering-code-reviewer.md`（批量蒸馏待 owner 样卡审定）。
+样例卡：`cards/product-product-manager.md`、`cards/engineering-code-reviewer.md`（owner 已审定）；
+批量蒸馏的 11 张大专家卡（子代理分 3 片并行产出，父进程逐卡结构/字节核验后提交）：
+`cards/` 现共 13 张，13 张大专家全覆盖。
 
 审计日志新增事件：`card-reinject` / `full-reinject-fallback` / `reinject-failed`。
 
