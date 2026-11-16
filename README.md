@@ -75,3 +75,24 @@ hermes chat -q "帮我 review 代码"
 hermes chat -q "帮我设计 UI"
 hermes chat -q "帮我写后端 API"
 ```
+
+## v2（2026-11-16，owner 裁决记录）
+
+行为变更（v1 首轮行为字节级保留）：
+
+| | v1 | v2 |
+|---|---|---|
+| 首轮 | 分类 → 注入专家全文 | 不变（**锚点专家**，每 session 唯一注入点） |
+| 后续轮 | **每轮重注入专家全文**（5–7K × 每轮） | **零注入**；检测到新领域 Y（≠锚点，conf≥0.7）→ 自动派发 Y **子专家** |
+| 子专家 | — | `delegate_task`（background，立即返回）；child 自读 `experts/Y.md` + 自取 `filemem_search`/`kb_search_central`；结果以新消息 append 重入 |
+| 前缀缓存 | 安全（注入只在 user 尾部） | 不变量收紧：注入只发生在首轮；子专家结果 = 追加新消息，system prompt 零改动 |
+
+owner 裁决：
+- **策略 B**：Y 子专家完成后允许为新任务重派（无每 session 上限）；running 期间不重派
+- **跨平台**：零硬编码路径常量（pathlib 运行时解析 + 显式 utf-8），无 `sys.platform` 分支
+- **循环守卫**：`[ASYNC DELEGATION COMPLETE — <id>]` 合成完成轮跳过检测 + 按 id 清 running 标志
+- **git 归属**：子专家只交付 findings，commit/push 归主进程
+
+审计日志：`<plugin 目录>/logs/dispatches.jsonl`（gitignored，fail-soft，每行一个事件：`anchor` / `dispatch` / `skip-running` / `subagent-result-reentered` / `dispatch-error`）。
+
+测试：`tests/test_intent_router_v2.py`（OS-agnostic，scratch venv 跑 pytest；含前缀缓存字节级回归测试）。

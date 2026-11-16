@@ -1,5 +1,5 @@
 name: intent-router
-version: "1.0.0"
-description: 动态专家上下文路由 — 根据用户意图自动加载对应领域专家技能
+version: "2.0.0"
+description: 动态专家上下文路由 v2 — 锚点专家固定注入一次 + 检测到新领域自动派发子专家（background，结果 append 重入，前缀缓存安全）
 author: hermes-agent
 license: MIT
