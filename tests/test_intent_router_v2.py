@@ -173,11 +173,13 @@ def test_new_domain_dispatches_sub_expert_with_self_serve_context(env):
         {"category": "engineering", "confidence": 0.9},
         {"category": "security", "confidence": 0.9},
     ]
-    _turn(env, "帮我写个 REST 后端 API", first=True)
+    r1 = _turn(env, "帮我写个 REST 后端 API", first=True)
+    # 宿主语义: turn-1 user message + 注入一起持久化 → 后续历史含它（v2.1 锚点标记可见 → 非压缩事件）
+    turn1_persisted = f"帮我写个 REST 后端 API\n{r1['context']}" if r1 else "帮我写个 REST 后端 API"
     r = _turn(env, "查一下这个 API 的 SQL 注入", first=False,
-               history=[{"role": "user", "content": "帮我写个 REST 后端 API"},
+               history=[{"role": "user", "content": turn1_persisted},
                         {"role": "assistant", "content": "done"}])
-    assert r is None                        # follow-ups NEVER inject
+    assert r is None                        # 标记可见 → 零补注；新域 → 只派发
     assert len(env.ctx.dispatch_calls) == 1
     tool, args, kw = env.ctx.dispatch_calls[0]
     assert tool == "delegate_task"

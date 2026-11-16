@@ -96,3 +96,21 @@ owner 裁决：
 审计日志：`<plugin 目录>/logs/dispatches.jsonl`（gitignored，fail-soft，每行一个事件：`anchor` / `dispatch` / `skip-running` / `subagent-result-reentered` / `dispatch-error`）。
 
 测试：`tests/test_intent_router_v2.py`（OS-agnostic，scratch venv 跑 pytest；含前缀缓存字节级回归测试）。
+
+## v2.1（2026-11-16，压缩后补注 — owner 裁决）
+
+新增：宿主 compaction/剪枝消化锚点专家全文后，自动补注**蒸馏卡**（事件驱动、幂等、前缀缓存安全）：
+
+| | v2 | v2.1 |
+|---|---|---|
+| 首轮锚点注入 | 全文注入一次 | 不变；wrapper 内嵌锚点标记 `<!--ir-expert:<slug>-->`（供压缩检测；仍属首轮尾部加法） |
+| 后续轮 | 零注入 + 新域派发 | 不变；**仅压缩事件轮**在该轮 user 尾部补注专家卡 |
+| 压缩后 | 专家全文被宿主消化，永久丢失 | 双标记缺失（+历史非空）→ 补注蒸馏卡（≤600 token）；卡缺失 → **全文回退**（裁决：专家不丢）；卡再丢再补（幂等） |
+
+蒸馏卡（`cards/<slug>.md`）：离线静态资产进 git，**带判断标准不带模板**（模板/细节只留"取全文"指针）。
+13 个大专家（6.5–24KB）出卡；15 个小专家（≤1.1KB）不出卡——补注走全文回退（本来就便宜）。
+样例卡：`cards/product-product-manager.md`、`cards/engineering-code-reviewer.md`（批量蒸馏待 owner 样卡审定）。
+
+审计日志新增事件：`card-reinject` / `full-reinject-fallback` / `reinject-failed`。
+
+测试：`tests/test_card_reinjection.py`（10 用例：压缩事件 / 幂等 / 再丢再补 / 卡缺失回退 / 无锚点 / 空历史 / 合成完成轮 / 压缩+派发同轮 / 历史零改动）。

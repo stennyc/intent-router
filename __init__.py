@@ -14,11 +14,17 @@ owner 裁决（2026-11-16，记录于代码）:
 
 设计:
 - Turn 1（v1 现况不变）: 分类 → 锚点专家 X，X 全文注入一次。
+  v2.1: 注入 wrapper 内埋锚点标记 `<!--ir-expert:<slug>-->`（压缩检测用；
+  仍属首轮尾部加法，缓存不变量不变）。
 - 之后每轮: aux 分类（temp 0, ~128 token，与主对话缓存无关）
     检测 == 锚点 / null / conf < 0.7 → 零动作
     检测 == Y ≠ 锚点 且 conf ≥ 0.7 → 立即派发 Y 子专家（background，
     立即返回；child 自读 experts/Y.md + 自取 filemem/kbs 持久上下文）
     后续轮次永不向主上下文注入（缓存不变量）
+- 压缩后补注（v2.1, owner 裁决 2026-11-16）: 宿主 compaction/剪枝把锚点专家
+  消化掉后（非空历史中双标记均缺失），当轮 user 尾部补注该专家的**蒸馏卡**
+  （cards/<slug>.md，≤600 token，离线蒸馏静态资产）；卡缺失 → 全文回退
+  （成本退回但专家不丢）；卡标记幂等（再丢再补）。空历史永不触发。
 - 循环守卫: `[ASYNC DELEGATION COMPLETE — <id>]` 完成消息是合成轮 ——
   按 delegation id 清 running 标志，且该轮跳过检测（防 检测→派发→重入→再检测 风暴）
 - 状态: 模块级 OrderedDict session_id → _SessionState（LRU 256，TTL 1h；
@@ -129,6 +135,12 @@ _CLASSIFY_INSTRUCTIONS = """分析用户消息的意图，返回最匹配的专�
 # 跨平台: 所有路径运行时 pathlib 解析，模块内零硬编码路径常量（owner 裁决）
 _EXPERTS_DIR = Path(__file__).resolve().parent / "experts"
 _LOG_PATH = Path(__file__).resolve().parent / "logs" / "dispatches.jsonl"
+_CARDS_DIR = Path(__file__).resolve().parent / "cards"
+
+# 压缩检测标记（v2.1, owner 裁决 2026-11-16）: 埋进注入 wrapper。压缩摘要/剪枝永远不会
+# 原样复述这两个 HTML 注释。历史里任一标记在 = "专家可见"；双缺失 + 历史非空 = 压缩事件。
+_ANCHOR_MARKER_FMT = "<!--ir-expert:{}-->"
+_CARD_MARKER_FMT = "<!--ir-card:{}-->"
 
 _CONFIDENCE_GATE = 0.7    # v1 阈值，不变
 _SESSION_TTL = 3600       # session 状态寿命（秒）
@@ -190,6 +202,18 @@ def _load_expert_context(expert_slug: str) -> Optional[str]:
     if content:
         return content
     return _fetch_expert_from_github(expert_slug)
+
+
+def _read_card(expert_slug: str) -> Optional[str]:
+    """专家卡（v2.1: 离线蒸馏静态资产 cards/<slug>.md，≤600 token，带判断标准不带模板）。
+    缺失返回 None —— 由调用方走全文回退（owner 裁决：卡缺失，专家不丢）。"""
+    card_file = _CARDS_DIR / f"{expert_slug}.md"
+    try:
+        if card_file.exists():
+            return card_file.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to read expert card {expert_slug}: {e}")
+    return None
 
 
 # ── 状态管理（模块级，零文件 I/O，天然跨平台） ─────────────────────────────
@@ -352,12 +376,81 @@ def _handle_completion_reentry(user_message: str, st: _SessionState, session_id:
     return True
 
 
-# ── 注入包装（v1 原样保留） ────────────────────────────────────────────────
+# ── 压缩后补注（v2.1） ──────────────────────────────────────────────────────
 
-def _wrap_injection(category: str, expert_content: str) -> str:
+def _history_text(conversation_history: Any) -> str:
+    """拼接各消息 content（str 或 content-parts list）。只读，fail-soft。"""
+    try:
+        parts = []
+        for m in conversation_history or []:
+            if not isinstance(m, dict):
+                continue
+            c = m.get("content")
+            if isinstance(c, list):
+                c = " ".join(str(p.get("text", "")) for p in c if isinstance(p, dict))
+            if c:
+                parts.append(str(c))
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def _expert_visible(st: _SessionState, conversation_history: Any) -> bool:
+    """锚点专家的标记（全文标记 或 卡标记）是否仍在当前历史里。"""
+    if not st.anchor:
+        return True
+    blob = _history_text(conversation_history)
+    return (_ANCHOR_MARKER_FMT.format(st.anchor) in blob
+            or _CARD_MARKER_FMT.format(st.anchor) in blob)
+
+
+def _reinject_after_compaction(st: _SessionState, session_id: str,
+                               conversation_history: Any) -> Optional[str]:
+    """压缩后补注（owner 裁决 2026-11-16）:
+    - 触发: 锚点已设 + 历史非空 + 双标记均缺失（= 专家被压缩/剪枝消化；空历史是
+      测试工件/压缩前状态，永不触发 —— v2 既有不变量）
+    - 内容: 专家卡优先（cards/<slug>.md）；卡缺失 → 全文回退（成本退回但专家不丢）
+    - 幂等: 卡注入后其标记留在历史里；再次被压缩才再补卡（卡便宜）
+    - 缓存安全: 返回值只 append 到当前轮 user message 尾部，历史零改动。
+    """
+    if not st.anchor or not conversation_history:
+        return None
+    if _expert_visible(st, conversation_history):
+        return None
+    slug = st.anchor
+    card = _read_card(slug)
+    if card:
+        body = (
+            f"【{slug} 专家卡 · 压缩后补注】\n"
+            "专家全文已被上下文压缩消化，以下为蒸馏卡（判断标准）；模板与细节以卡内"
+            "「取全文」指针为准：\n\n"
+            f"{_CARD_MARKER_FMT.format(slug)}\n{card}\n"
+            "---\n*intent-router 压缩后补卡（每次压缩事件补一次；卡再丢再补）*"
+        )
+        _log(session_id, "card-reinject", expert=slug, source="card")
+        return body
+    full = _load_expert_context(slug)
+    if full:
+        body = (
+            f"【{slug} 专家全文 · 压缩后补注（卡缺失，回退全文）】\n\n"
+            f"{_ANCHOR_MARKER_FMT.format(slug)}\n{full}\n"
+            "---\n*intent-router 压缩后补全文（owner 裁决：卡缺失时回退全文；"
+            "卡缺失是资产 bug，应重新蒸馏）*"
+        )
+        _log(session_id, "full-reinject-fallback", expert=slug, source="full-text")
+        return body
+    _log(session_id, "reinject-failed", expert=slug, reason="card-and-full-text-both-missing")
+    return None
+
+
+# ── 注入包装（v1 原样保留 + v2.1 埋锚点标记） ──────────────────────────────
+
+def _wrap_injection(category: str, slug: str, expert_content: str) -> str:
+    """v2.1: 埋锚点标记（供压缩检测）；其余字节保持 v1 原样。"""
     return f"""【{category}领域专家上下文】
 以下是当前会话的专家指导，请参照执行：
 
+{_ANCHOR_MARKER_FMT.format(slug)}
 {expert_content}
 
 ---
@@ -402,25 +495,27 @@ def _make_hook(ctx: Any):
                 return None
             st.anchor = slug
             _log(session_id, "anchor", category=category, expert=slug, confidence=confidence)
-            return {"context": _wrap_injection(category, content)}
+            return {"context": _wrap_injection(category, slug, content)}
 
-        # ── 后续轮: 只检测，永不注入（前缀缓存不变量） ──
+        # ── 后续轮: 压缩补注（事件驱动）+ 新域检测（v2 零注入不变量不变） ──
+        reinject_ctx = _reinject_after_compaction(st, session_id, conversation_history)
         category, confidence = _classify(ctx, msg)
-        if category is None or confidence < _CONFIDENCE_GATE:
-            return None
-        slug = CATEGORY_MAP.get(category)
-        if not slug:
-            return None
-        if slug == st.anchor:
-            return None  # 仍在锚点域 → 专家已驻留历史，零动作
+        slug = None
+        if category is not None and confidence >= _CONFIDENCE_GATE:
+            slug = CATEGORY_MAP.get(category)
+        if slug is None or slug == st.anchor:
+            # 仍在锚点域 / 无新域 → 不派发；压缩事件轮仍补注（尾部加法，缓存安全）
+            return {"context": reinject_ctx} if reinject_ctx else None
+        # 走到这里 ⇒ slug 有效且 ≠ 锚点 ⇒ category 必非 None（slug 由它派生）
+        assert category is not None
         with _LOCK:
             _sweep_running(st)
             if slug in st.running:
                 _log(session_id, "skip-running", category=category, expert=slug)
-                return None
+                return {"context": reinject_ctx} if reinject_ctx else None
         _dispatch_sub_expert(ctx, st, session_id, msg, conversation_history,
                              category, slug, confidence)
-        return None
+        return {"context": reinject_ctx} if reinject_ctx else None
 
     return _intent_router_hook
 
