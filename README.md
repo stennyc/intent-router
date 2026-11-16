@@ -133,3 +133,33 @@ owner 裁决：
 审计日志新增事件：`manual-anchor` / `manual-full-reinject` / `manual-list` / `manual-clear` / `manual-invalid`。
 
 测试：`tests/test_expert_command.py`（9 用例：切换 / 下一轮补全文 / slug 形态 / 在场只切不注 / 列表 / clear / 未知参数 / 首轮命令 / 与 running 派发交互）。
+
+## v2.3（2026-11-17，anchor_inject 配置开关 — owner 裁决）
+
+背景：profile 的 `SOUL.md` 已含专家 persona（域 profile：security-engineer /
+data-engineer / devops / product-manager / researcher / reviewer）时，第一轮
+自动锚点注入 = 纯重复（5–7K token）+ 注意力稀释。插件运行时**看不见** SOUL.md
+（`pre_llm_call` 契约不传 system prompt / context files；宿主源码实证），
+故不做自动检测，改为 per-profile 显式开关（决策权归 owner）：
+
+```yaml
+# profile 的 config.yaml
+plugins:
+  entries:
+    intent-router:
+      settings:
+        anchor_inject: false
+```
+
+| | 默认（true/缺省） | `anchor_inject: false` |
+|---|---|---|
+| 首轮 | 分类 + 锚点注入 | **跳过**（不烧 aux 调用），anchor 保持 None |
+| 后续轮 | 检测 + 子专家派发 + 压缩补注 | 同左（无锚点模式：新域照旧派子专家，补注不触发） |
+| `/expert` | 可用 | **不受影响**（显式指令 > 隐式自动） |
+
+fail-soft：配置读取异常/宿主无 get_config → 按 true 处理（行为同 v2.2）。
+配置经 `ctx.get_config`（宿主一等 API，读 profile `plugins.entries.intent-router.settings`），零硬编码路径，跨平台。
+
+审计日志新增事件：`anchor-disabled`。
+
+测试：`tests/test_anchor_inject_config.py`（4 用例：off 跳过首轮 / off 无锚点派发保留 / off 下 /expert 仍可锚定 / 缺省回归）。

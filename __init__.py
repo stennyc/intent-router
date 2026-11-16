@@ -15,6 +15,10 @@ owner 裁决（2026-11-16，记录于代码）:
   切锚点（专家不在场 → 下一轮补全文；已在场 → 只切不注）；/expert 列表；
   /expert clear 清锚点。命令轮走宿主 veto（{"action":"block"}）——不进推理、
   不烧分类；命令解析不依赖 LLM。
+- anchor_inject 开关（v2.3, owner 裁决 2026-11-17）: profile 的 SOUL.md 已含
+  专家 persona 时（域 profile），配置 plugins.entries.intent-router.settings
+  .anchor_inject=false → 首轮跳过分类+注入（免重复+免稀释），/expert 手动切换
+  不受影响；缺省/异常 = true（fail-soft，行为同 v2.2）。
 
 设计:
 - Turn 1（v1 现况不变）: 分类 → 锚点专家 X，X 全文注入一次。
@@ -479,6 +483,19 @@ def _wrap_injection(category: str, slug: str, expert_content: str) -> str:
 （注意：无论上述专家上下文使用什么语言，你的回复必须使用用户输入的语言。）"""
 
 
+# ── anchor_inject 配置开关（v2.3, owner 裁决 2026-11-17） ─────────────────
+# profile 的 SOUL.md 已含专家 persona（域 profile）时，第一轮自动锚点是纯重复
+# + 注意力稀释。per-profile 配置（plugins.entries.intent-router.settings）:
+#   anchor_inject: false → 首轮跳过分类+注入，/expert 手动切换不受影响
+# 缺省 / 读取异常 = true（fail-soft 保守默认，与 v2.2 行为一致）。
+
+def _anchor_inject_enabled(ctx: Any) -> bool:
+    try:
+        return bool(ctx.get_config("anchor_inject", True))
+    except Exception:
+        return True   # 宿主无 get_config / 配置损坏 → 保守保持自动锚点
+
+
 # ── /expert 手动覆盖（v2.2, owner 裁决 2026-11-17 "继续完成"） ─────────────
 # 宿主 veto 通道（turn_context.py: {"action":"block"} → 该轮终止、不进推理、不烧分类）:
 #   /expert <category|slug>  切锚点（专家不在场 → 下一轮补全文；已在场 → 只切不注）
@@ -551,6 +568,11 @@ def _make_hook(ctx: Any):
             return expert_block
 
         if is_first_turn:
+            # v2.3: profile 配置 anchor_inject=false → 跳过首轮自动锚点（SOUL.md 已有
+            # 专家 persona；/expert 手动切换在上方命令分支，不受此开关影响）
+            if not _anchor_inject_enabled(ctx):
+                _log(session_id, "anchor-disabled")
+                return None
             # ── v1 现况不变: 首轮问候守卫 + 分类 + 锚点注入（唯一注入点） ──
             if len(msg.strip()) < 10:
                 return None
