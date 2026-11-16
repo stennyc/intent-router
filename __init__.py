@@ -11,6 +11,10 @@ owner 裁决（2026-11-16，记录于代码）:
 - 派发策略 B: Y 子专家完成后允许为新任务重派（无每 session 上限）；
   running 期间不重派。
 - git 归属: 子专家只交付 findings，git commit/push 归主进程。
+- /expert 手动覆盖（v2.2, owner 裁决 2026-11-17）: /expert <category|slug>
+  切锚点（专家不在场 → 下一轮补全文；已在场 → 只切不注）；/expert 列表；
+  /expert clear 清锚点。命令轮走宿主 veto（{"action":"block"}）——不进推理、
+  不烧分类；命令解析不依赖 LLM。
 
 设计:
 - Turn 1（v1 现况不变）: 分类 → 锚点专家 X，X 全文注入一次。
@@ -157,13 +161,15 @@ _COMPLETION_ID_RE = re.compile(r"\[ASYNC DELEGATION (?:BATCH )?COMPLETE[^\]]*?([
 
 
 class _SessionState:
-    __slots__ = ("anchor", "running", "last_seen")
+    __slots__ = ("anchor", "running", "last_seen", "full_on_next")
 
     def __init__(self) -> None:
         self.anchor: Optional[str] = None
         # slug -> (delegation_id, dispatched_at)
         self.running: Dict[str, Tuple[str, float]] = {}
         self.last_seen: float = time.time()
+        # v2.2: /expert 手动切换后，若专家标记不在上下文 → 下一次补注事件给全文（不给卡）
+        self.full_on_next: bool = False
 
 
 _SESSIONS: "OrderedDict[str, _SessionState]" = OrderedDict()
@@ -406,18 +412,33 @@ def _expert_visible(st: _SessionState, conversation_history: Any) -> bool:
 
 def _reinject_after_compaction(st: _SessionState, session_id: str,
                                conversation_history: Any) -> Optional[str]:
-    """压缩后补注（owner 裁决 2026-11-16）:
+    """压缩后补注（owner 裁决 2026-11-16；v2.2 加 /expert 手动切换语义）:
     - 触发: 锚点已设 + 历史非空 + 双标记均缺失（= 专家被压缩/剪枝消化；空历史是
       测试工件/压缩前状态，永不触发 —— v2 既有不变量）
     - 内容: 专家卡优先（cards/<slug>.md）；卡缺失 → 全文回退（成本退回但专家不丢）
+    - v2.2: st.full_on_next（/expert 手动切换且专家不在场）→ 本次给全文不给卡，消费后置回
     - 幂等: 卡注入后其标记留在历史里；再次被压缩才再补卡（卡便宜）
     - 缓存安全: 返回值只 append 到当前轮 user message 尾部，历史零改动。
     """
     if not st.anchor or not conversation_history:
         return None
     if _expert_visible(st, conversation_history):
+        st.full_on_next = False     # 专家已在场：消费切换标志，避免迟到的全文注入
         return None
     slug = st.anchor
+    if st.full_on_next:
+        st.full_on_next = False     # 手动切换（刻意行为）：本次补全文，不给卡
+        full = _load_expert_context(slug)
+        if full:
+            body = (
+                f"【{slug} 专家全文 · 手动切换补注（/expert）】\n\n"
+                f"{_ANCHOR_MARKER_FMT.format(slug)}\n{full}\n"
+                "---\n*intent-router 手动切换专家（owner 指令 /expert；"
+                "后续压缩事件仍按卡优先规则补注）*"
+            )
+            _log(session_id, "manual-full-reinject", expert=slug)
+            return body
+        # 全文也缺失 → 落入卡/回退路径
     card = _read_card(slug)
     if card:
         body = (
@@ -458,6 +479,51 @@ def _wrap_injection(category: str, slug: str, expert_content: str) -> str:
 （注意：无论上述专家上下文使用什么语言，你的回复必须使用用户输入的语言。）"""
 
 
+# ── /expert 手动覆盖（v2.2, owner 裁决 2026-11-17 "继续完成"） ─────────────
+# 宿主 veto 通道（turn_context.py: {"action":"block"} → 该轮终止、不进推理、不烧分类）:
+#   /expert <category|slug>  切锚点（专家不在场 → 下一轮补全文；已在场 → 只切不注）
+#   /expert                  显示当前锚点 + 可用 category 列表
+#   /expert clear            清锚点（回无专家模式）
+_EXPERT_CMD_RE = re.compile(r"^\s*/expert(?:\s+(\S+))?\s*$", re.IGNORECASE)
+_EXPERT_SLUGS = frozenset(CATEGORY_MAP.values())
+
+
+def _handle_expert_command(msg: str, st: _SessionState, session_id: str,
+                           conversation_history: Any) -> Optional[Dict[str, str]]:
+    """/expert 命令 → 返回 veto dict；非命令返回 None（放行给常规流程）。"""
+    m = _EXPERT_CMD_RE.match(msg)
+    if not m:
+        return None
+    arg = (m.group(1) or "").lower()
+    if not arg:
+        current = st.anchor or "（无）"
+        listing = ", ".join(sorted(CATEGORY_MAP.keys()))
+        _log(session_id, "manual-list")
+        return {"action": "block", "message": (
+            f"intent-router: 当前锚点专家 = {current}\n"
+            f"可用 category: {listing}\n"
+            f"用法: /expert <category|expert slug>（如 /expert security）或 /expert clear")}
+    if arg == "clear":
+        st.anchor = None
+        st.full_on_next = False
+        _log(session_id, "manual-clear")
+        return {"action": "block", "message": "intent-router: 锚点专家已清除，回到无专家模式。"}
+    slug = CATEGORY_MAP.get(arg)
+    if slug is None and arg in _EXPERT_SLUGS:
+        slug = arg
+    if slug is None:
+        _log(session_id, "manual-invalid", arg=arg)
+        return {"action": "block", "message": (
+            f"intent-router: 未知专家/category '{arg}' —— 输入 /expert 查看有效列表")}
+    st.anchor = slug
+    # 专家标记已在当前上下文 → 只切锚点（专家已在场，零注入）；否则下一轮补全文
+    st.full_on_next = not _expert_visible(st, conversation_history)
+    _log(session_id, "manual-anchor", expert=slug, source=arg,
+         full_on_next=st.full_on_next)
+    note = "（下一轮注入全文）" if st.full_on_next else "（专家已在上下文中，即时生效）"
+    return {"action": "block", "message": f"intent-router: 锚点专家已切换为 {slug} {note}"}
+
+
 # ── hook ────────────────────────────────────────────────────────────────────
 
 def _make_hook(ctx: Any):
@@ -478,6 +544,11 @@ def _make_hook(ctx: Any):
         # 0) 循环守卫: 合成完成轮 → 清 running + 跳过检测
         if _handle_completion_reentry(msg, st, session_id):
             return None
+
+        # 0.5) /expert 手动覆盖（v2.2）: 命令轮走宿主 veto，不进推理、不烧分类
+        expert_block = _handle_expert_command(msg, st, session_id, conversation_history)
+        if expert_block is not None:
+            return expert_block
 
         if is_first_turn:
             # ── v1 现况不变: 首轮问候守卫 + 分类 + 锚点注入（唯一注入点） ──

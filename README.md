@@ -116,3 +116,20 @@ owner 裁决：
 审计日志新增事件：`card-reinject` / `full-reinject-fallback` / `reinject-failed`。
 
 测试：`tests/test_card_reinjection.py`（10 用例：压缩事件 / 幂等 / 再丢再补 / 卡缺失回退 / 无锚点 / 空历史 / 合成完成轮 / 压缩+派发同轮 / 历史零改动）。
+
+## v2.2（2026-11-17，/expert 手动覆盖 — owner 裁决"继续完成"）
+
+新增：`/expert` 命令手动控制锚点专家（纯命令解析，不依赖 LLM 分类）：
+
+| 指令 | 行为 |
+|---|---|
+| `/expert <category\|slug>`（如 `/expert security`、`/expert engineering-security-engineer`） | 切锚点；该轮走宿主 veto（`{"action":"block"}` + 确认消息）——**不进推理、不烧分类**。专家标记不在当前上下文 → 下一轮补注**全文**（手动切换是刻意行为）；标记已在上下文 → 只切锚点（专家已在场，零注入） |
+| `/expert`（无参） | block：显示当前锚点 + 全部可用 category 列表（状态不动） |
+| `/expert clear` | 清锚点，回无专家模式 |
+| 未知参数 | block 报错 + 提示看列表（状态不动） |
+
+命令轮与子专家 running 状态互不干扰；完成消息重入仍按 delegation id 清 running。
+
+审计日志新增事件：`manual-anchor` / `manual-full-reinject` / `manual-list` / `manual-clear` / `manual-invalid`。
+
+测试：`tests/test_expert_command.py`（9 用例：切换 / 下一轮补全文 / slug 形态 / 在场只切不注 / 列表 / clear / 未知参数 / 首轮命令 / 与 running 派发交互）。
