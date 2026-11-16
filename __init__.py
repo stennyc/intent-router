@@ -616,4 +616,4 @@ def _make_hook(ctx: Any):
 def register(ctx) -> None:
     """插件注册入口（宿主加载时调用一次）"""
     ctx.register_hook("pre_llm_call", _make_hook(ctx))
-    logger.info("intent-router v2 registered (anchor expert + auto sub-expert dispatch)")
+    logger.info("intent-router v2.3 registered (anchor + sub-expert dispatch + card reinjection + /expert + anchor_inject switch)")
