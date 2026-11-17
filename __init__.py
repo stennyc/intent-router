@@ -720,7 +720,11 @@ def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_mess
     deleg_id, channel = _launch_via_channels(ctx, st, session_id, slug, category, confidence,
                                               goal, context_text, expert_path, task_label)
     if channel in ("subagent_lifecycle", "delegate_task"):
-        assert deleg_id is not None    # 成功通道必带关联 id（_launch_via_channels 契约）
+        if deleg_id is None:
+            # F5: 成功通道缺关联 id（契约违反）→ fail-soft 记异常, 不出卡不记账
+            #（不用 assert: -O 下被剥离, 不变量失效会静默打出 delegation_id=None 卡片）
+            _log(session_id, "dispatch-anomaly", expert=slug, channel=channel)
+            return None, None
         # v2.5 L1+L4: 成功同轮台账卡——主专家从开工第一秒知道分工（勿重复 + 审计键）
         return deleg_id, _ledger_card(slug, task_label, deleg_id, channel)
     if channel == "refused":
@@ -1094,10 +1098,17 @@ def _launch_pending(ctx: Any, st: _SessionState, session_id: str, slug: str,
     deleg_id, channel = _launch_via_channels(ctx, st, session_id, slug, category, confidence,
                                               goal, context_text, expert_path, task_label)
     if channel in ("subagent_lifecycle", "delegate_task"):
-        assert deleg_id is not None
-        st.ledger_due[slug] = (deleg_id, task_label, channel)
+        if deleg_id is None:
+            # F5: 成功通道缺关联 id（契约违反）→ fail-soft 记异常, 不污染记账面（与 pre 入口一致）
+            _log(session_id, "dispatch-anomaly", expert=slug, channel=channel)
+            return
+        # F4: 共享 dict 写入持锁（消费侧 _consume_ledger_due / 写侧 st.pending 同纪律）
+        with _LOCK:
+            st.ledger_due[slug] = (deleg_id, task_label, channel)
     elif channel == "refused":
-        st.fallback_due[slug] = (confidence, task_label, category)
+        # F4: 同上, 持锁写
+        with _LOCK:
+            st.fallback_due[slug] = (confidence, task_label, category)
 
 
 def _make_post_hook(ctx: Any):

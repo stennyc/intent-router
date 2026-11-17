@@ -306,3 +306,39 @@ def test_post_mode_terminal_polling_unaffected(env):
     assert "交接" in r["context"] and "主专家下一步" in r["context"]
     assert [e for e in _events(env) if e["event"] == "subagent-result-recovered"]
     assert env.mod._SESSIONS["s1"].lifecycle == {}
+
+
+# ── F4/F5 review-fix（reviewer 复盘 2026-11-17） ──────────────────────────
+
+def test_success_channel_without_id_is_fail_soft(env, monkeypatch):
+    """F5: 成功通道缺关联 id（契约违反）→ fail-soft 记 dispatch-anomaly:
+    不 raise（生产断言在 -O 下会被剥离, 不能靠 assert 守不变量）、
+    不出台账卡、不占 ledger_due/fallback_due。pre/post 两个入口都钉。"""
+    mod = env.mod
+    monkeypatch.setattr(mod, "_launch_via_channels",
+                        lambda *a, **k: (None, "subagent_lifecycle"))
+    st = mod._get_state("s1")
+    r = mod._dispatch_sub_expert(env.ctx, st, "s1", "msg", [], "engineering",
+                                 "engineering-security-engineer", 0.9)
+    assert r == (None, None), "pre 入口: 契约违反不得 raise、不得出卡"
+    mod._launch_pending(env.ctx, st, "s1", "engineering-security-engineer",
+                        "engineering", 0.9, "label", "goal", "ctx-text",
+                        mod._EXPERTS_DIR / "engineering-security-engineer.md")
+    assert st.ledger_due == {} and st.fallback_due == {}, "post 入口: 异常不得污染记账面"
+    assert [e for e in _events(env) if e["event"] == "dispatch-anomaly"], _events(env)
+
+
+def test_post_success_lands_ledger_due(env):
+    """F4: post 模式 launch 成功记账 st.ledger_due（3 元组 (id, label, channel)）,
+    下一 pre 轮消费交付 post 变体台账卡——写/读循环钉死。"""
+    svc = _FakeLifecycle()
+    _setup_post_mode(env, svc)
+    _post(env, "做个安全审查")
+    st = env.mod._SESSIONS["s1"]
+    deleg_id = st.ledger_due["engineering-security-engineer"][0]
+    assert st.ledger_due["engineering-security-engineer"] == (
+        deleg_id, "做个安全审查", "subagent_lifecycle")
+    env.ctx.llm.scripts.append({"category": "engineering", "confidence": 0.9})
+    r3 = _turn(env, "继续", first=False)
+    assert r3 is not None and "分工台账" in r3["context"]
+    assert st.ledger_due == {}, "消费后须清空"
