@@ -176,7 +176,7 @@ gateway 模式下 `PluginManager._cli_ref=None`，`ctx.dispatch_tool("delegate_t
 
 | 通道 | 机制 | 适用 |
 |---|---|---|
-| ① subagent-lifecycle | `ctx.subagent_lifecycle`（宿主 SubagentLifecycleService；父 agent 由宿主 turn facade 每轮 contextvar bind，hook 线程经 copy_context 继承——已实证）。宿主属性为 @cached_property 形态时**属性本身即服务实例**（插件鸭子类型: 有 launch/status 直接用, 否则按工厂调用）；返回 SubagentHandle(subagent_id) 作关联 id | **gateway 模式（桌面）** |
+| ① subagent-lifecycle | `ctx.subagent_lifecycle`（宿主 SubagentLifecycleService；父 agent 由宿主 turn facade 每轮 contextvar bind，hook 线程经 copy_context 继承——已实证）。宿主属性为 @cached_property 形态时**属性本身即服务实例**（插件鸭子类型: 有 launch/status 直接用, 否则按工厂调用）；返回 SubagentHandle(subagent_id) 作关联 id。v2.4.3 结果回收: 宿主 status() 第三道门要求 poll 时刻 contextvar 父 session 与 handle 匹配（活体 100% UNKNOWN 根因）→ 插件在 launch 时刻冻结 contextvars 快照、poll 在冻结快照里 replay 宿主 API；UNKNOWN 连续 3 次才判 lost（保留重试窗口），lost 注入诚实指针卡 + `resolver_session`/`frozen_session` 诊断（宿主公开 API 探测, 宿主零改动） | **gateway 模式（桌面）** |
 | ② delegate_task 旧通道 | `ctx.dispatch_tool("delegate_task")`，成功记 `dispatch(channel=delegate_task)`；拒绝记 `dispatch-refused`（不污染 running） | CLI 模式 |
 | ③ 降级 in-session 注入 | 双通道全拒且专家正文可得 → 专家全文当轮注入，记 `dispatch-fallback-injection` | 兜底 |
 

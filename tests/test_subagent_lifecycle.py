@@ -23,6 +23,7 @@ import logging
 import re
 from pathlib import Path
 from types import SimpleNamespace
+import contextvars
 
 import pytest
 
@@ -347,10 +348,15 @@ def test_lifecycle_result_failed_is_cleared(env):
 
 
 def test_lifecycle_unknown_handle_is_lost(env):
-    """handle 失踪（如 gateway 重启, 注册表随进程丢失）→ 清账不卡死, 记 lost。"""
+    """v2.4.3: handle 失踪（如 gateway 重启, 宿主注册表随进程丢失）→ 3 连 UNKNOWN 后
+    清账不卡死, 记 lost（1-2 连保留重试窗口）。"""
     svc = _FakeLifecycle()
     sid = _dispatched(env, svc)
     svc.status_script[sid] = "UNKNOWN"
+    for _ in (1, 2):
+        env.ctx.llm.scripts.append({"category": "engineering", "confidence": 0.9})
+        _turn(env, "那单元测试怎么写", first=False)
+    assert env.mod._SESSIONS["s1"].lifecycle, "3 连窗口内不得清账"
     env.ctx.llm.scripts.append({"category": "engineering", "confidence": 0.9})
     _turn(env, "那单元测试怎么写", first=False)
     evs = _events(env)
@@ -380,3 +386,112 @@ def test_registration_line_version_follows_manifest(caplog):
     recs = [r for r in caplog.records if "registered" in r.getMessage()]
     assert recs, "registration log line missing"
     assert f"intent-router v{ver} registered" in recs[-1].getMessage(), recs[-1].getMessage()
+
+
+# ── v2.4.3: 结果回收修复（活体 0/6 recovered，全部 unknown-handle）────────
+# 宿主 SubagentLifecycleService.status() 的 _record() 第三道门要求 poll 时刻
+# contextvar 里活着的父 agent session 与 handle 匹配；活体 pre_llm_call worker
+# 快照解析不到 → 全灭。插件侧修复（宿主零改动）:
+# B: launch 时刻冻结 contextvars（launch 成功 = 该上下文 resolver 已被证明 work），
+#    poll 在冻结上下文里 replay → 宿主读到的 contextvar 值与 launch 时刻一致
+# C: UNKNOWN 不再一次清账 —— 3 连 UNKNOWN 才判 lost（_RUNNING_TTL sweep 兜底），
+#    lost 注入诚实指针卡（产物去哪找），主进程至少"接"到交代
+# A: lost 事件带 resolver_session/frozen_session 诊断（宿主公开 API 探测，best-effort）
+
+_TEST_CTXVAR: "contextvars.ContextVar[str]" = contextvars.ContextVar("ir_test_ctx", default=None)
+
+
+def test_poll_replays_launch_context(env):
+    """B: status() 必须在 launch 时刻冻结的上下文里执行（宿主 gate3 依赖 contextvar）。"""
+    import contextvars
+    svc = _FakeLifecycle()
+    seen: dict = {}
+    orig = svc.status
+
+    def spy(hdict):
+        seen["at_status"] = _TEST_CTXVAR.get()
+        return orig(hdict)
+
+    svc.status = spy
+    launcher = contextvars.copy_context()
+
+    def do_launch():
+        _TEST_CTXVAR.set("launch-bound")
+        return _dispatched(env, svc)
+
+    sid = launcher.run(do_launch)
+    # 主线程（poll 侧）该 contextvar = 默认 None；只有冻结上下文里是 "launch-bound"
+    svc.status_script[sid] = "SUCCEEDED"
+    svc.results[sid] = SimpleNamespace(summary="FROZEN-OK")
+    env.ctx.llm.scripts.append({"category": "security", "confidence": 0.9})
+    r = _turn(env, "继续", first=False)
+    assert seen.get("at_status") == "launch-bound", f"status 未在冻结上下文执行: {seen}"
+    assert r and "FROZEN-OK" in r["context"]
+
+
+def test_unknown_not_cleared_until_retry_cap(env):
+    """C+A: UNKNOWN 保留重试（3 连才 lost）；lost 事件带诊断字段；lost 注入指针卡。"""
+    svc = _FakeLifecycle()
+    sid = _dispatched(env, svc)
+    svc.status_script[sid] = "UNKNOWN"
+    for i in (1, 2):
+        env.ctx.llm.scripts.append({"category": "security", "confidence": 0.9})
+        r = _turn(env, "继续", first=False)
+        assert r is None, f"UNKNOWN #{i} 不该注入任何东西"
+        assert env.mod._SESSIONS["s1"].lifecycle, f"UNKNOWN #{i} 不得清账（保留重试窗口）"
+        assert not [e for e in _events(env) if e["event"] == "subagent-result-lost"], \
+            "3 连之前不得判 lost"
+    env.ctx.llm.scripts.append({"category": "security", "confidence": 0.9})
+    r3 = _turn(env, "继续", first=False)
+    lost = [e for e in _events(env) if e["event"] == "subagent-result-lost"]
+    assert lost and lost[0]["delegation_id"] == sid
+    # A: 诊断字段（测试环境宿主模块不可 import → unavailable；生产 gateway 内为真实 session/none）
+    assert "resolver_session" in lost[0] and "frozen_session" in lost[0], lost[0]
+    assert lost[0]["resolver_session"] in ("unavailable", "none", "no-session", "probe-error", ""), lost[0]
+    # C: 指针卡 append-only 注入（主进程至少接诚实交代）
+    assert r3 and "context" in r3 and sid in r3["context"]
+    # D: lost 清守卫后同轮立即重派新子专家接任务（owner 策略 B），旧 entry 被新 sid 取代
+    assert env.mod._SESSIONS["s1"].lifecycle, "lost 后同轮重派（新 sid 接任务）"
+    assert env.mod._SESSIONS["s1"].lifecycle["engineering-security-engineer"][0] != sid
+
+
+def test_recovered_after_unknown_via_frozen_context(env):
+    """B+C: 一次 UNKNOWN 后注册表恢复 → 下一轮即 recovered（活体故障的修复路径）。"""
+    svc = _FakeLifecycle()
+    sid = _dispatched(env, svc)
+    svc.status_script[sid] = "UNKNOWN"
+    env.ctx.llm.scripts.append({"category": "security", "confidence": 0.9})
+    r1 = _turn(env, "继续", first=False)
+    assert env.mod._SESSIONS["s1"].lifecycle, "UNKNOWN 后条目必须保留"
+    svc.status_script[sid] = "SUCCEEDED"
+    svc.results[sid] = SimpleNamespace(summary="RECOVERED-AFTER-UNKNOWN")
+    env.ctx.llm.scripts.append({"category": "security", "confidence": 0.9})
+    r2 = _turn(env, "继续", first=False)
+    assert r2 and "RECOVERED-AFTER-UNKNOWN" in r2["context"], \
+        f"UNKNOWN 后恢复失败: {r2} events={_events(env)}"
+
+
+def test_lifecycle_dispatch_holds_running_guard(env):
+    """v2.4.3 (D): lifecycle 通道占 running 守卫 → 同域后续轮 skip-running 不重派
+    （旧行为: 每轮重派 + st.lifecycle[slug] 被覆盖 → 旧 handle 孤儿化, 结果永不回收）。
+    终态清守卫 → 完成后允许为新任务重派（owner 策略 B）。"""
+    svc = _FakeLifecycle()
+    sid = _dispatched(env, svc)
+    env.ctx.llm.scripts.append({"category": "security", "confidence": 0.9})
+    _turn(env, "再做个安全审查", first=False)
+    assert len(svc.launch_calls) == 1, "同域第 2 次派发必须被 running 守卫拦下"
+    sk = [e for e in _events(env) if e["event"] == "skip-running"]
+    assert sk and sk[0]["expert"] == "engineering-security-engineer"
+    assert env.mod._SESSIONS["s1"].lifecycle["engineering-security-engineer"][0] == sid, \
+        "原 handle 不得被重派覆盖（孤儿化）"
+    # 终态清守卫 → 同轮立即重派接新任务（owner 策略 B）
+    svc.status_script[sid] = "SUCCEEDED"
+    svc.results[sid] = SimpleNamespace(summary="DONE")
+    env.ctx.llm.scripts.append({"category": "security", "confidence": 0.9})
+    r = _turn(env, "继续下一个任务", first=False)
+    assert r and "DONE" in r["context"]
+    assert len(svc.launch_calls) == 2, "完成后同轮立即重派（策略 B: 新任务接上）"
+    assert env.mod._SESSIONS["s1"].running["engineering-security-engineer"][0] == "sub-0002"
+    env.ctx.llm.scripts.append({"category": "security", "confidence": 0.9})
+    _turn(env, "同域再来一个任务", first=False)
+    assert len(svc.launch_calls) == 2, "running 期间不重派（守卫生效）"

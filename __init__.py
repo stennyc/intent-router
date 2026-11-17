@@ -44,6 +44,7 @@ import json
 import logging
 import re
 import time
+import contextvars
 from collections import OrderedDict
 from pathlib import Path
 from threading import Lock
@@ -154,6 +155,7 @@ _CONFIDENCE_GATE = 0.7    # v1 阈值，不变
 _SESSION_TTL = 3600       # session 状态寿命（秒）
 _SESSIONS_MAX = 256       # LRU 上限
 _RUNNING_TTL = 1800       # running 标志兜底过期（秒）—— 完成消息丢失时防永久卡死
+_UNKNOWN_RETRY_CAP = 3    # v2.4.3: UNKNOWN 连续 N 次才判 lost（宿主 gate 瞬时不匹配给重试窗口）
 
 # 宿主 async-delegation 完成消息的重入标记。两种形态（live probe 2026-11-16 实证）:
 #   单任务:   "[ASYNC DELEGATION COMPLETE — <delegation_id>]"   (_format_async_delegation)
@@ -174,9 +176,10 @@ class _SessionState:
         self.last_seen: float = time.time()
         # v2.2: /expert 手动切换后，若专家标记不在上下文 → 下一次补注事件给全文（不给卡）
         self.full_on_next: bool = False
-        # v2.4: slug -> (subagent_id, handle_dict, dispatched_at) — 宿主
-        # subagent-lifecycle 通道派发的子专家（gateway 模式可用；结果经轮询恢复）
-        self.lifecycle: Dict[str, Tuple[str, Optional[dict], float]] = {}
+        # v2.4: slug -> lifecycle entry（宿主 subagent-lifecycle 通道派发的子专家；
+        # 结果经轮询恢复）。v2.4.3 5 元组: (subagent_id, handle_dict, dispatched_at,
+        # frozen_contextvars, unknown_count)；_lifecycle_entry() 兼容旧 3 元组。
+        self.lifecycle: Dict[str, tuple] = {}
 
 
 _SESSIONS: "OrderedDict[str, _SessionState]" = OrderedDict()
@@ -253,8 +256,17 @@ def _sweep_running(st: _SessionState) -> None:
     now = time.time()
     for slug in [s for s, (_d, ts) in st.running.items() if now - ts > _RUNNING_TTL]:
         del st.running[slug]
-    for slug in [s for s, (_d, _h, ts) in st.lifecycle.items() if now - ts > _RUNNING_TTL]:
+    for slug in [s for s, e in st.lifecycle.items() if now - _lifecycle_entry(e)[2] > _RUNNING_TTL]:
         del st.lifecycle[slug]
+
+
+def _lifecycle_entry(entry):
+    """lifecycle entry 解包（v2.4.3 5 元组 → 兼容旧 3 元组）。
+    5 元组: (subagent_id, handle_dict, dispatched_at, frozen_context, unknown_count)。"""
+    if len(entry) == 3:
+        sid, hdict, ts = entry
+        return (sid, hdict, ts, None, 0)
+    return entry
 
 
 # ── 结构化审计日志（fail-soft：日志故障绝不影响 hook） ────────────────────
@@ -393,21 +405,30 @@ def _lifecycle_dispatch(ctx: Any, st: _SessionState, session_id: str,
         sid = str(getattr(handle, "subagent_id", "") or "")
         if not sid:
             raise RuntimeError("lifecycle handle missing subagent_id")
+        # v2.4.3 (B): 冻结当前 contextvars 快照。宿主 lifecycle gate3 要求 poll 时刻
+        # contextvar 里的父 agent session 与 handle 匹配；launch 成功即证明此刻
+        # worker 快照里的 resolver 可用 → poll 在冻结快照里 replay 宿主 API。
+        frozen = contextvars.copy_context()
     except Exception as e:
         _log(session_id, "lifecycle-unavailable", expert=slug, error=str(e)[:300])
         return None
     with _LOCK:
         _sweep_running(st)
-        st.lifecycle[slug] = (sid, _handle_to_dict(handle), time.time())
+        st.lifecycle[slug] = (sid, _handle_to_dict(handle), time.time(), frozen, 0)
+        # v2.4.3 (D): lifecycle 通道也占 running 守卫 —— 否则同域后续轮每轮重派,
+        # st.lifecycle[slug] 被新 sid 覆盖 → 旧子专家 handle 成孤儿（结果永不回收）
+        st.running[slug] = (sid, time.time())
     _log(session_id, "dispatch", category=category, expert=slug, confidence=confidence,
          delegation_id=sid, channel="subagent_lifecycle", expert_path=str(expert_path))
     return sid
 
 
 def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[str]:
-    """v2.4: 轮询 lifecycle 通道子专家, 完成即把 findings append 进本轮 context（缓存安全）。
-    非终态保留; UNKNOWN（handle 失踪, 如 gateway 重启）清账不卡死。
-    服务缺席时静默: st.lifecycle 只有在本进程派发成功时才有条目（重启后模块态即清空）。"""
+    """v2.4.3: 轮询 lifecycle 通道子专家, 完成即把 findings append 进本轮 context（缓存安全）。
+    非终态保留; UNKNOWN（宿主 gate 不匹配/注册表失踪）不再一次清账: 连续
+    _UNKNOWN_RETRY_CAP 次才判 lost（_RUNNING_TTL sweep 兜底），期间注册表恢复即
+    recovered。宿主 gate3 依赖 contextvar → status/result 在 launch 时刻冻结的
+    contextvars 快照里 replay（_lifecycle_dispatch 存的第 4 元）。"""
     if not st.lifecycle:
         return None
     svc, _absent = _get_lifecycle_service(ctx)
@@ -417,42 +438,103 @@ def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[st
     with _LOCK:
         _sweep_running(st)
         pending = list(st.lifecycle.items())
-    for slug, (sid, hdict, _ts) in pending:
+    for slug, raw_entry in pending:
+        sid, hdict, ts, frozen, unk = _lifecycle_entry(raw_entry)
         if hdict is None:
             continue
+
+        def _in(fn):
+            return frozen.run(fn) if frozen is not None else fn()
+
         status: Any = None
         try:
-            status = svc.status(hdict)
+            status = _in(lambda: svc.status(hdict))
         except Exception:
             status = None
         state = str(getattr(status, "state", "UNKNOWN") or "UNKNOWN")
         if state in ("RUNNING", "PENDING", "STARTING", "CANCEL_REQUESTED"):
             continue
+        terminal = state in ("SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED")
         result: Any = None
-        if state in ("SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED"):
+        if terminal:
             try:
-                result = svc.result(hdict)
+                result = _in(lambda: svc.result(hdict))
             except Exception:
                 result = None
+        if terminal:
+            with _LOCK:
+                st.lifecycle.pop(slug, None)
+                # v2.4.3 (D): 终态清 running 守卫（owner 策略 B: 完成后允许为新任务重派）;
+                # _RUNNING_TTL sweep 兜底防漏清
+                if st.running.get(slug, ("", 0.0))[0] == sid:
+                    del st.running[slug]
+            if state == "SUCCEEDED":
+                summary = str(getattr(result, "summary", None) or "").strip()
+                if summary:
+                    _log(session_id, "subagent-result-recovered", expert=slug, delegation_id=sid)
+                    pieces.append(f"## Sub-expert findings ({slug})\n{summary}")
+                else:
+                    _log(session_id, "subagent-result-recovered", expert=slug,
+                         delegation_id=sid, note="empty-summary")
+            else:
+                err = str(getattr(result, "error_message", None)
+                          or getattr(result, "error_classification", None) or state)
+                _log(session_id, "subagent-result-failed", expert=slug, delegation_id=sid,
+                     state=state, error=err[:300])
+            continue
+        # UNKNOWN: 宿主 gate 不匹配或注册表已清 → 重试窗口（不动 running 守卫——守卫属于原 sid）
+        unk += 1
+        if unk < _UNKNOWN_RETRY_CAP:
+            with _LOCK:
+                st.lifecycle[slug] = (sid, hdict, ts, frozen, unk)
+            continue
         with _LOCK:
             st.lifecycle.pop(slug, None)
-        if state == "SUCCEEDED":
-            summary = str(getattr(result, "summary", None) or "").strip()
-            if summary:
-                _log(session_id, "subagent-result-recovered", expert=slug, delegation_id=sid)
-                pieces.append(f"## Sub-expert findings ({slug})\n{summary}")
-            else:
-                _log(session_id, "subagent-result-recovered", expert=slug,
-                     delegation_id=sid, note="empty-summary")
-        elif state in ("FAILED", "INTERRUPTED", "CANCELLED"):
-            err = str(getattr(result, "error_message", None)
-                      or getattr(result, "error_classification", None) or state)
-            _log(session_id, "subagent-result-failed", expert=slug, delegation_id=sid,
-                 state=state, error=err[:300])
-        else:  # UNKNOWN 等: handle 失踪（注册表随进程重启丢失）
-            _log(session_id, "subagent-result-lost", expert=slug, delegation_id=sid,
-                 note="unknown-handle")
+            if st.running.get(slug, ("", 0.0))[0] == sid:
+                del st.running[slug]
+        probe = _probe_resolver(frozen)
+        _log(session_id, "subagent-result-lost", expert=slug, delegation_id=sid,
+             note="unknown-handle", unknown_count=unk, **probe)
+        pieces.append(_lost_pointer(slug, sid))
     return "\n\n".join(pieces) if pieces else None
+
+
+def _probe_resolver(frozen: Any) -> Dict[str, str]:
+    """v2.4.3 (A): UNKNOWN 清账时的宿主 resolver 诊断（best-effort, 宿主零改动）。
+    读宿主公开 API get_active_subagent_parent() —— 当前上下文 + 冻结上下文各探一次,
+    直接写明 gate3 卡在哪: none=快照无绑定, 异 session=绑定漂移, 真实 session=注册表失踪。"""
+    try:
+        from agent.subagent_lifecycle import get_active_subagent_parent
+    except Exception:
+        return {"resolver_session": "unavailable", "frozen_session": "unavailable"}
+
+    def _probe() -> str:
+        try:
+            p = get_active_subagent_parent()
+        except Exception:
+            return "probe-error"
+        if p is None:
+            return "none"
+        return str(getattr(p, "session_id", "") or "") or "no-session"
+
+    cur = _probe()
+    try:
+        frz = frozen.run(_probe) if frozen is not None else "no-frozen"
+    except Exception:
+        frz = "probe-error"
+    return {"resolver_session": cur, "frozen_session": frz}
+
+
+def _lost_pointer(slug: str, sid: str) -> str:
+    """v2.4.3: UNKNOWN 重试耗尽的诚实指针卡——主进程至少"接"到交代（append-only）。"""
+    return (
+        f"## Sub-expert status ({slug})\n"
+        f"Host subagent {sid}: result registry entry unavailable after "
+        f"{_UNKNOWN_RETRY_CAP} polls (gateway restart cleared the in-process host registry, "
+        f"or the host lifecycle context gate rejected the poll). Findings are NOT recoverable "
+        f"via the lifecycle API; the sub-expert ran in its own host subagent session — search "
+        f"host logs / supercompress / filemem by delegation id {sid}."
+    )
 
 
 def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_message: str,
