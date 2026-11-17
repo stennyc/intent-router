@@ -339,16 +339,25 @@ def _join_ctx(*pieces: Optional[str]) -> Optional[str]:
     return out or None
 
 
-def _get_lifecycle_service(ctx: Any) -> Any:
+def _get_lifecycle_service(ctx: Any) -> Tuple[Any, Optional[str]]:
     """v2.4 通道①: 宿主 PluginContext.subagent_lifecycle()（SubagentLifecycleService）。
-    旧宿主/测试 ctx 无此 API → None（走旧通道，零行为变化）。"""
+    返回 (service, absent_reason): 可用 → (svc, None)；不可用 → (None, 原因)。
+    旧宿主/ctx 无该 API → reason='attr-missing'（不再静默, 见 lifecycle-absent 事件）。"""
     try:
         factory = getattr(ctx, "subagent_lifecycle", None)
-        if not callable(factory):
-            return None
-        return factory() or None
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"getattr-error: {str(e)[:200]}"
+    if factory is None:
+        return None, "attr-missing"
+    if not callable(factory):
+        return None, "attr-not-callable"
+    try:
+        svc = factory()
+    except Exception as e:
+        return None, f"factory-error: {str(e)[:300]}"
+    if svc is None:
+        return None, "factory-returned-none"
+    return svc, None
 
 
 def _handle_to_dict(handle: Any) -> Optional[dict]:
@@ -366,9 +375,11 @@ def _lifecycle_dispatch(ctx: Any, st: _SessionState, session_id: str,
     bind 进 contextvar（gateway 模式 _cli_ref=None 时 dispatch_tool 拿不到 parent, 此通道可用）。
     launch 接受 Mapping（宿主 _coerce_request）；返回 SubagentHandle(subagent_id, to_dict)。
     结果不产生 [ASYNC DELEGATION] 重入（宿主重入通知只在 delegate_task 派发层注册）
-    → 轮询 _poll_lifecycle 是结果交付的唯一通道。成功返回 subagent_id, 不可用返回 None。"""
-    svc = _get_lifecycle_service(ctx)
+    → 轮询 _poll_lifecycle 是结果交付的唯一通道。成功返回 subagent_id, 不可用返回 None
+    （不可用原因记 lifecycle-absent；launch 被拒记 lifecycle-unavailable）。"""
+    svc, absent_reason = _get_lifecycle_service(ctx)
     if svc is None:
+        _log(session_id, "lifecycle-absent", expert=slug, reason=absent_reason or "unknown")
         return None
     try:
         handle = svc.launch({"goal": goal, "context": context_text, "role": "leaf"})
@@ -388,10 +399,11 @@ def _lifecycle_dispatch(ctx: Any, st: _SessionState, session_id: str,
 
 def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[str]:
     """v2.4: 轮询 lifecycle 通道子专家, 完成即把 findings append 进本轮 context（缓存安全）。
-    非终态保留; UNKNOWN（handle 失踪, 如 gateway 重启）清账不卡死。"""
+    非终态保留; UNKNOWN（handle 失踪, 如 gateway 重启）清账不卡死。
+    服务缺席时静默: st.lifecycle 只有在本进程派发成功时才有条目（重启后模块态即清空）。"""
     if not st.lifecycle:
         return None
-    svc = _get_lifecycle_service(ctx)
+    svc, _absent = _get_lifecycle_service(ctx)
     if svc is None:
         return None
     pieces: list[str] = []
@@ -758,4 +770,4 @@ def _make_hook(ctx: Any):
 def register(ctx) -> None:
     """插件注册入口（宿主加载时调用一次）"""
     ctx.register_hook("pre_llm_call", _make_hook(ctx))
-    logger.info("intent-router v2.4 registered (anchor + sub-expert dispatch via subagent-lifecycle + card reinjection + /expert + anchor_inject + refused-observability)")
+    logger.info("intent-router v2.4.1 registered (anchor + sub-expert dispatch via subagent-lifecycle + card reinjection + /expert + anchor_inject + refused-observability + lifecycle-absent diagnostics)")

@@ -196,21 +196,70 @@ def test_lifecycle_unavailable_falls_back_to_delegate_task(env):
 
 
 def test_no_lifecycle_service_keeps_legacy_path(env):
-    """旧宿主（ctx 无 subagent_lifecycle）→ 行为与 v2.3 完全一致。"""
+    """旧宿主（PluginContext 无 subagent_lifecycle 属性）→ 行为与 v2.3 完全一致; 且记
+    lifecycle-absent(reason=attr-missing), 不再静默。"""
+
+    class _BareCtx:
+        def __init__(self):
+            self.llm = _FakeLLM()
+            self.dispatch_calls = []
+
+        def dispatch_tool(self, tool_name, args, **kw):
+            self.dispatch_calls.append((tool_name, args, kw))
+            return json.dumps({"status": "dispatched", "delegation_id": "deleg_0001"})
+
+    ctx = _BareCtx()
+    ctx.llm.scripts = [
+        {"category": "engineering", "confidence": 0.9},
+        {"category": "security", "confidence": 0.9},
+    ]
+    env.ctx = ctx
+    _turn(env, "帮我写个 REST 后端 API", first=True)
+    r = _turn(env, "做个安全审查", first=False)
+    assert len(ctx.dispatch_calls) == 1
+    evs = _events(env)
+    assert not [e for e in evs if e["event"] == "lifecycle-unavailable"], evs
+    assert not [e for e in evs if e.get("event") == "dispatch" and e.get("channel") == "subagent_lifecycle"]
+    assert r is None
+    absent = [e for e in evs if e["event"] == "lifecycle-absent"]
+    assert absent and "attr-missing" in absent[0].get("reason", ""), evs
+
+
+def test_lifecycle_factory_error_records_absent(env):
+    """factory() 抛异常（宿主 import 链故障等）→ 记 lifecycle-absent(reason=factory-error), 走旧通道。"""
     ctx = _FakeCtx()
-    ctx.lifecycle_svc = None
+
+    def _boom():
+        raise RuntimeError("import chain broken")
+
+    ctx.subagent_lifecycle = _boom
     env.ctx = ctx
     ctx.llm.scripts = [
         {"category": "engineering", "confidence": 0.9},
         {"category": "security", "confidence": 0.9},
     ]
     _turn(env, "帮我写个 REST 后端 API", first=True)
-    r = _turn(env, "做个安全审查", first=False)
-    assert len(env.ctx.dispatch_calls) == 1
+    _turn(env, "做个安全审查", first=False)
     evs = _events(env)
-    assert not [e for e in evs if e["event"] == "lifecycle-unavailable"], evs
-    assert not [e for e in evs if e.get("event") == "dispatch" and e.get("channel") == "subagent_lifecycle"]
-    assert r is None
+    absent = [e for e in evs if e["event"] == "lifecycle-absent"]
+    assert absent and "factory-error" in absent[0].get("reason", ""), evs
+    assert [e for e in evs if e["event"] == "dispatch" and e.get("channel") == "delegate_task"], evs
+
+
+def test_lifecycle_service_none_records_absent(env):
+    """factory() 返回 None → lifecycle-absent(reason=factory-returned-none)。"""
+    ctx = _FakeCtx()
+    ctx.subagent_lifecycle = lambda: None
+    env.ctx = ctx
+    ctx.llm.scripts = [
+        {"category": "engineering", "confidence": 0.9},
+        {"category": "security", "confidence": 0.9},
+    ]
+    _turn(env, "帮我写个 REST 后端 API", first=True)
+    _turn(env, "做个安全审查", first=False)
+    evs = _events(env)
+    absent = [e for e in evs if e["event"] == "lifecycle-absent"]
+    assert absent and "factory-returned-none" in absent[0].get("reason", ""), evs
 
 
 # ── 结果轮询: recovered / failed / lost ─────────────────────────────────────

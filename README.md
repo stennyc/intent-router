@@ -186,6 +186,9 @@ gateway 模式下 `PluginManager._cli_ref=None`，`ctx.dispatch_tool("delegate_t
 - `subagent-result-recovered`（SUCCEEDED，findings 进 context，缓存安全）
 - `subagent-result-failed`（FAILED/INTERRUPTED/CANCELLED）
 - `subagent-result-lost`（UNKNOWN handle，如 gateway 重启后注册表丢失；清账不卡死）
+- `lifecycle-absent`（通道①不可用及原因：`attr-missing` 旧宿主 /
+  `factory-error` 宿主 import 链故障 / `factory-returned-none` — 2026-11-17 重启后
+  复查发现通道①静默缺席, 补此事件定位；launch 被拒另有 `lifecycle-unavailable`）
 
 零回归保证：旧宿主/无 lifecycle API 的 ctx → 行为与 v2.3 完全一致（测试钉死）。
-测试：`tests/test_dispatch_refused.py`（5 用例）+ `tests/test_subagent_lifecycle.py`（7 用例），全量 54 passed。
+测试：`tests/test_dispatch_refused.py`（5 用例）+ `tests/test_subagent_lifecycle.py`（9 用例），全量 56 passed。
