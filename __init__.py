@@ -29,6 +29,13 @@ owner 裁决（2026-11-16，记录于代码）:
      delegation 审计键 → 跨重启可经 jsonl/filemem 重新锚定。
   折入: F-2（lifecycle 3 元组兼容分支删除, 生产不可达死代码）+
   F-4（lost 诊断字段测试断言收紧为 "unavailable" 精确值）。
+- 平台守卫（v2.5.1 P0, owner 指认"代码侧问题"查实 2026-11-17）: 宿主
+  turn_context.py:906 对每个 agent 回合无条件触发 pre_llm_call（只排除 detached
+  fork）→ 子 agent session 自己的回合也跑完整路由流水线。活体实证: 池 jsonl 42 条
+  子 session anchor-disabled 事件（coder profile anchor_inject=false 短路, 仅噪声）；
+  默认 profile 下 = 错误专家全文注入子 agent + 孙代级联派发。修复: hook 入口
+  `parent_session_id or platform == "subagent"` 短路（OR 语义, 宿主零改动），
+  每 session 记一次 subagent-guard 审计事件。
 
 设计:
 - Turn 1（v1 现况不变）: 分类 → 锚点专家 X，X 全文注入一次。
@@ -177,7 +184,7 @@ _COMPLETION_ID_RE = re.compile(r"\[ASYNC DELEGATION (?:BATCH )?COMPLETE[^\]]*?([
 
 
 class _SessionState:
-    __slots__ = ("anchor", "running", "last_seen", "full_on_next", "lifecycle")
+    __slots__ = ("anchor", "running", "last_seen", "full_on_next", "lifecycle", "guard_logged")
 
     def __init__(self) -> None:
         self.anchor: Optional[str] = None
@@ -192,6 +199,8 @@ class _SessionState:
         # （L1 台账 / L2 提醒的任务标签, 同 running 窗口内字节稳定）；
         # _lifecycle_entry() 归一 6 元组（F-2: 旧 3 元组兼容分支已删, 生产不可达）。
         self.lifecycle: Dict[str, tuple] = {}
+        # v2.5.1 P0: subagent-guard 审计节流（每 session 记一次, 防多 API-call 子专家刷 jsonl）
+        self.guard_logged: bool = False
 
 
 _SESSIONS: "OrderedDict[str, _SessionState]" = OrderedDict()
@@ -876,11 +885,25 @@ def _make_hook(ctx: Any):
         st = _get_state(session_id)
         msg = _normalize_user_message(user_message)
 
-        # 0) 循环守卫: 合成完成轮 → 清 running + 跳过检测
+        # 0) P0 平台守卫（v2.5.1, owner 指认"代码侧问题"查实 2026-11-17）: 子 agent
+        #    session 自己的回合不得进入路由流水线。宿主 turn_context.py:906 对每个
+        #    agent 回合无条件触发 pre_llm_call（只排除 detached fork），kwargs 带
+        #    platform（子 agent = "subagent"）+ parent_session_id —— 无守卫时默认
+        #    profile（anchor_inject=true）会把错误专家全文注入子 agent（persona 冲突
+        #    + 膨胀）、烧 aux 分类、并可能孙代级联派发（子专家拉子专家）。
+        #    OR 语义: 任一信号即挡（宿主版本演进下双信号互为备份）。
+        #    审计: 每 session 记一次 subagent-guard（多 API-call 子专家不刷 jsonl）。
+        if (kwargs.get("parent_session_id") or platform == "subagent"):
+            if not st.guard_logged:
+                st.guard_logged = True
+                _log(session_id, "subagent-guard")
+            return None
+
+        # 0.5) 循环守卫: 合成完成轮 → 清 running + 跳过检测
         if _handle_completion_reentry(msg, st, session_id):
             return None
 
-        # 0.5) /expert 手动覆盖（v2.2）: 命令轮走宿主 veto，不进推理、不烧分类
+        # 1) /expert 手动覆盖（v2.2）: 命令轮走宿主 veto，不进推理、不烧分类
         expert_block = _handle_expert_command(msg, st, session_id, conversation_history)
         if expert_block is not None:
             return expert_block

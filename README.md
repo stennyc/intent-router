@@ -254,3 +254,18 @@ gateway 模式下 `PluginManager._cli_ref=None`，`ctx.dispatch_tool("delegate_t
 测试：`tests/test_delegation_ledger.py`（10 用例：L1 双通道台账 + 全拒不发 /
 L2 提醒字节稳定 + skip-running 同轮 + UNKNOWN 静默 / L3 recovered·failed·lost
 交接卡 / F-4 诊断精确值）。全量 77 passed（基线 67 + 新增 10，零回归）。宿主零改动。
+
+## v2.5.1（2026-11-17，P0 平台守卫——owner 指认"代码侧问题"查实）
+- 活体实证：宿主 `turn_context.py:906` 对每个 agent 回合无条件触发 `pre_llm_call`
+  （只排除 `_persist_disabled` detached fork）→ 子 agent session 自己的回合也跑
+  完整路由流水线。池 jsonl 42 条子 session `anchor-disabled` 事件（coder profile
+  anchor_inject=false 在首轮分支短路 → 仅噪声 + 浪费 get_config）；**默认 profile
+  （anchor_inject=true）= 错误专家全文注入子 agent（persona 冲突 + 膨胀）+ 烧 aux
+  分类 + 孙代级联派发风险**。
+- 修复：hook 入口 `parent_session_id or platform == "subagent"` 短路（OR 语义，
+  双信号互为备份防宿主版本演进；宿主零改动），每 session 记一次
+  `subagent-guard` 审计事件（多 API-call 子专家不刷 jsonl）。
+
+测试：`tests/test_subagent_guard.py`（6 用例：platform/parent 双信号短路 +
+审计节流 + 默认 profile 事故钉死 + 主 session 双零回归）。全量 83 passed
+（基线 77 + 新增 6，零回归）。宿主零改动。
