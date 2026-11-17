@@ -246,6 +246,26 @@ def test_lifecycle_factory_error_records_absent(env):
     assert [e for e in evs if e["event"] == "dispatch" and e.get("channel") == "delegate_task"], evs
 
 
+def test_lifecycle_attr_not_callable_reason_includes_types(env):
+    """宿主 facade 形态（2026-11-17 18:03 实证: 属性存在但不可调用）→ reason 带
+    ctx/attr 类型名, 定位无需再重启盲猜。"""
+    ctx = _FakeCtx()
+    ctx.subagent_lifecycle = "sentinel-placeholder"   # 实例属性遮蔽方法, 模拟 facade 占位符
+    env.ctx = ctx
+    ctx.llm.scripts = [
+        {"category": "engineering", "confidence": 0.9},
+        {"category": "security", "confidence": 0.9},
+    ]
+    _turn(env, "帮我写个 REST 后端 API", first=True)
+    _turn(env, "做个安全审查", first=False)
+    evs = _events(env)
+    absent = [e for e in evs if e["event"] == "lifecycle-absent"]
+    assert absent, evs
+    r = absent[0].get("reason", "")
+    assert r.startswith("attr-not-callable"), r
+    assert "ctx=" in r and "attr=str" in r, r
+
+
 def test_lifecycle_service_none_records_absent(env):
     """factory() 返回 None → lifecycle-absent(reason=factory-returned-none)。"""
     ctx = _FakeCtx()

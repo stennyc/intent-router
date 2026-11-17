@@ -350,7 +350,8 @@ def _get_lifecycle_service(ctx: Any) -> Tuple[Any, Optional[str]]:
     if factory is None:
         return None, "attr-missing"
     if not callable(factory):
-        return None, "attr-not-callable"
+        # 宿主 facade 形态（2026-11-17 实证）: 属性存在但不可调用 → 带上类型名定位
+        return None, f"attr-not-callable (ctx={type(ctx).__name__}, attr={type(factory).__name__})"
     try:
         svc = factory()
     except Exception as e:
