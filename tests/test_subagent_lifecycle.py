@@ -247,10 +247,9 @@ def test_lifecycle_factory_error_records_absent(env):
 
 
 def test_lifecycle_attr_not_callable_reason_includes_types(env):
-    """宿主 facade 形态（2026-11-17 18:03 实证: 属性存在但不可调用）→ reason 带
-    ctx/attr 类型名, 定位无需再重启盲猜。"""
+    """属性既非服务又不可调用（纯占位符形态）→ reason 带 ctx/attr 类型名, 定位无需再重启盲猜。"""
     ctx = _FakeCtx()
-    ctx.subagent_lifecycle = "sentinel-placeholder"   # 实例属性遮蔽方法, 模拟 facade 占位符
+    ctx.subagent_lifecycle = "sentinel-placeholder"   # 实例属性遮蔽方法, 模拟占位符
     env.ctx = ctx
     ctx.llm.scripts = [
         {"category": "engineering", "confidence": 0.9},
@@ -264,6 +263,29 @@ def test_lifecycle_attr_not_callable_reason_includes_types(env):
     r = absent[0].get("reason", "")
     assert r.startswith("attr-not-callable"), r
     assert "ctx=" in r and "attr=str" in r, r
+
+
+def test_lifecycle_attr_is_service_instance_spawns_directly(env):
+    """宿主实证形态（2026-11-17 18:11 活体诊断: ctx=PluginContext,
+    attr=SubagentLifecycleService — 宿主把 subagent_lifecycle 定义为 @cached_property,
+    属性访问直接得到服务实例）: 插件必须直接使用该实例, 不再走工厂调用。"""
+    svc = _FakeLifecycle()
+    ctx = _FakeCtx()
+    ctx.subagent_lifecycle = svc      # 属性 = 服务实例（遮蔽工厂方法形态）
+    env.ctx = ctx
+    ctx.llm.scripts = [
+        {"category": "engineering", "confidence": 0.9},
+        {"category": "security", "confidence": 0.9},
+    ]
+    _turn(env, "帮我写个 REST 后端 API", first=True)
+    r = _turn(env, "做个安全审查", first=False)
+    assert len(svc.launch_calls) == 1, "服务实例应被直接 launch"
+    evs = _events(env)
+    d = [e for e in evs if e["event"] == "dispatch" and e.get("channel") == "subagent_lifecycle"]
+    assert d and d[0]["delegation_id"].startswith("sub-"), evs
+    assert not [e for e in evs if e["event"] in ("lifecycle-absent", "lifecycle-unavailable")], evs
+    assert not [e for e in evs if e["event"] == "dispatch-refused"], evs
+    assert r is None
 
 
 def test_lifecycle_service_none_records_absent(env):

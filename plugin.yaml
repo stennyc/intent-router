@@ -1,5 +1,5 @@
 name: intent-router
-version: "2.4.1"
+version: "2.4.2"
 description: 动态专家上下文路由 v2.4.1 — 锚点专家固定注入 + 新领域子专家派发（宿主 subagent-lifecycle 通道, gateway 模式真子 agent + 结果轮询交付; 旧通道拒绝观测 + 降级注入 + lifecycle-absent 诊断）+ 压缩后蒸馏卡补注 + /expert 手动覆盖 + anchor_inject 配置开关
 author: hermes-agent
 license: MIT

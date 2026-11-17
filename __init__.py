@@ -340,17 +340,23 @@ def _join_ctx(*pieces: Optional[str]) -> Optional[str]:
 
 
 def _get_lifecycle_service(ctx: Any) -> Tuple[Any, Optional[str]]:
-    """v2.4 通道①: 宿主 PluginContext.subagent_lifecycle()（SubagentLifecycleService）。
-    返回 (service, absent_reason): 可用 → (svc, None)；不可用 → (None, 原因)。
-    旧宿主/ctx 无该 API → reason='attr-missing'（不再静默, 见 lifecycle-absent 事件）。"""
+    """v2.4 通道①: 宿主 PluginContext.subagent_lifecycle。
+    两种宿主形态都支持（鸭子类型, 零宿主耦合）:
+    - 属性直接是服务实例（宿主 @cached_property 形态, 2026-11-17 活体实证:
+      attr=SubagentLifecycleService）→ 直接用
+    - 属性是工厂方法/可调对象 → 调用得到服务
+    返回 (service, absent_reason): 可用 → (svc, None)；不可用 → (None, 原因)。"""
     try:
         factory = getattr(ctx, "subagent_lifecycle", None)
     except Exception as e:
         return None, f"getattr-error: {str(e)[:200]}"
     if factory is None:
         return None, "attr-missing"
+    # 宿主实证形态: 属性本身即服务实例（有 launch/status 面）→ 直接采用
+    if hasattr(factory, "launch") and hasattr(factory, "status"):
+        return factory, None
     if not callable(factory):
-        # 宿主 facade 形态（2026-11-17 实证）: 属性存在但不可调用 → 带上类型名定位
+        # 既非服务又不可调用 → 带类型名定位
         return None, f"attr-not-callable (ctx={type(ctx).__name__}, attr={type(factory).__name__})"
     try:
         svc = factory()

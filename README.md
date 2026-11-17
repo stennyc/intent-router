@@ -176,7 +176,7 @@ gateway 模式下 `PluginManager._cli_ref=None`，`ctx.dispatch_tool("delegate_t
 
 | 通道 | 机制 | 适用 |
 |---|---|---|
-| ① subagent-lifecycle | `ctx.subagent_lifecycle().launch({goal, context, role})`（宿主 SubagentLifecycleService；父 agent 由宿主 turn facade 每轮 contextvar bind，hook 线程经 copy_context 继承——已实证）。返回 SubagentHandle(subagent_id) 作关联 id | **gateway 模式（桌面）** |
+| ① subagent-lifecycle | `ctx.subagent_lifecycle`（宿主 SubagentLifecycleService；父 agent 由宿主 turn facade 每轮 contextvar bind，hook 线程经 copy_context 继承——已实证）。宿主属性为 @cached_property 形态时**属性本身即服务实例**（插件鸭子类型: 有 launch/status 直接用, 否则按工厂调用）；返回 SubagentHandle(subagent_id) 作关联 id | **gateway 模式（桌面）** |
 | ② delegate_task 旧通道 | `ctx.dispatch_tool("delegate_task")`，成功记 `dispatch(channel=delegate_task)`；拒绝记 `dispatch-refused`（不污染 running） | CLI 模式 |
 | ③ 降级 in-session 注入 | 双通道全拒且专家正文可得 → 专家全文当轮注入，记 `dispatch-fallback-injection` | 兜底 |
 
