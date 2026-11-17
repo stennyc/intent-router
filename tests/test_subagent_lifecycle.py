@@ -495,3 +495,58 @@ def test_lifecycle_dispatch_holds_running_guard(env):
     env.ctx.llm.scripts.append({"category": "security", "confidence": 0.9})
     _turn(env, "同域再来一个任务", first=False)
     assert len(svc.launch_calls) == 2, "running 期间不重派（守卫生效）"
+
+
+# ── v2.4.4: 主/子专家协作面（各做各的 → 边界感知 + 成果持久 + 接入指引）────
+# 活体实证（2026-11-17）: 本聊天"请排查"同任务被主进程与子专家各做一遍,
+# 子专家 72 个 API call 的 findings 随 gateway 重启蒸發, 主进程零感知。
+# F3 边界感知: launch context 注入锚点专家 slug + "只交付 findings 不重复主进程工作"
+# F2 成果持久: 指示子专家完成时写 filemem（slug+时间窗检索键）→ 跨重启可捞回
+# F4 接入指引: recovered/lost 卡面写明"采纳/核验而非重做 + filemem 检索键"
+
+def test_launch_context_carries_boundary_and_persistence(env):
+    """F3+F2: lifecycle 通道 launch 的 context 含任务边界（锚点 slug）+ filemem 持久化指令。"""
+    svc = _FakeLifecycle()
+    _dispatched(env, svc)
+    ctx_text = svc.launch_calls[0]["context"]
+    st = env.mod._SESSIONS["s1"]
+    assert "engineering-backend-architect" in ctx_text, "边界行须带主会话锚点专家 slug"
+    assert "任务边界" in ctx_text and "不重复" in ctx_text
+    assert "filemem" in ctx_text and "slug=engineering-security-engineer" in ctx_text
+
+
+def test_channel_two_context_also_enriched(env):
+    """F3+F2 是共享 context_text: 通道②（delegate_task, CLI 模式）同样受益。"""
+    svc = _FakeLifecycle()
+    svc.raise_on_launch = RuntimeError("No active Hermes parent session is available.")
+    _dispatched(env, svc)
+    assert env.ctx.dispatch_calls, "通道① 不可用 → 通道② 接管"
+    ctx_text = env.ctx.dispatch_calls[0][1]["tasks"][0]["context"]
+    assert "任务边界" in ctx_text and "filemem" in ctx_text
+
+
+def test_recovered_card_directs_adopt_not_redo(env):
+    """F4: recovered 卡面指引主专家"采纳/核验而非重做" + filemem 持久副本检索键。"""
+    svc = _FakeLifecycle()
+    sid = _dispatched(env, svc)
+    svc.status_script[sid] = "SUCCEEDED"
+    svc.results[sid] = SimpleNamespace(summary="FINDINGS-BODY")
+    env.ctx.llm.scripts.append({"category": "security", "confidence": 0.9})
+    r = _turn(env, "继续", first=False)
+    assert r and "FINDINGS-BODY" in r["context"]
+    assert "而非重做" in r["context"] and "filemem" in r["context"], r["context"]
+
+
+def test_lost_pointer_directs_filemem_search(env):
+    """F4: lost 指针卡指引 filemem 检索（slug 键）——F2 持久化后跨重启成果可捞回。"""
+    svc = _FakeLifecycle()
+    sid = _dispatched(env, svc)
+    svc.status_script[sid] = "UNKNOWN"
+    for _ in range(3):
+        env.ctx.llm.scripts.append({"category": "engineering", "confidence": 0.9})
+        _turn(env, "继续", first=False)
+    lost = [e for e in _events(env) if e["event"] == "subagent-result-lost"]
+    assert lost and lost[0]["delegation_id"] == sid
+    # 卡文案断言（_lost_pointer 输出, 清账轮经 context 注入）: 直接调函数验证
+    card = env.mod._lost_pointer("engineering-security-engineer", sid)
+    assert "filemem" in card and "engineering-security-engineer" in card and "而非重做" in card, card

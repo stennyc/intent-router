@@ -192,3 +192,39 @@ gateway 模式下 `PluginManager._cli_ref=None`，`ctx.dispatch_tool("delegate_t
 
 零回归保证：旧宿主/无 lifecycle API 的 ctx → 行为与 v2.3 完全一致（测试钉死）。
 测试：`tests/test_dispatch_refused.py`（5 用例）+ `tests/test_subagent_lifecycle.py`（9 用例），全量 56 passed。
+
+## v2.4.2（2026-11-17，通道①活体根因修复）
+- 诊断事件 `lifecycle-absent` 带类型名 → 活体实证 `attr-not-callable
+  (ctx=PluginContext, attr=SubagentLifecycleService)`：宿主 `subagent_lifecycle`
+  是 @cached_property，**属性本身即服务实例**（不是工厂）
+- `_get_lifecycle_service` 鸭子类型化：属性带 launch/status 面 → 直接用；
+  否则若可调用 → 按工厂调用。零宿主耦合
+- 注册行版本号改读 plugin.yaml manifest（此前硬编码字面量漂移：活体跑 v2.4.2
+  却打 v2.4.1 注册行 → 验收信号失真）
+
+## v2.4.3（2026-11-17，结果回收修复——活体 0/6 recovered 全灭）
+- 根因（宿主只读勘察 + 沙箱复现钉死）：宿主 `status()` 的 `_record()` 第三道门
+  要求 poll 时刻 contextvar 里的活父 agent session 与 handle 匹配；活体
+  pre_llm_call worker 快照解析不到 → 全部 UNKNOWN_HANDLE
+- **B 冻结上下文**：launch 成功即 `contextvars.copy_context()` 冻住（该快照里
+  resolver 已被证明 work），poll 在冻结快照里 replay 宿主 status/result
+- **C 重试窗口**：UNKNOWN 不再一次清账——连续 3 次才判 lost（_RUNNING_TTL
+  sweep 兜底），期间注册表恢复即 recovered；lost 注入诚实指针卡
+- **D 重派风暴**：旧码 lifecycle 通道不占 `st.running` 守卫 → 同域每轮重派 +
+  lifecycle entry 被新 sid 覆盖 → 旧 handle 孤儿化（活体 100% 回收失败的放大器）；
+  修复后 running 期 skip-running，终态清守卫同轮重派接新任务（owner 策略 B）
+- **A 诊断**：lost 事件带 `resolver_session`/`frozen_session`（宿主公开 API
+  get_active_subagent_parent 双上下文探测，best-effort）
+
+## v2.4.4（2026-11-17，主/子专家协作面——"各做各的"）
+- 活体实证：同任务主进程与子专家各做一遍（子专家 72 API call 的 findings 随
+  gateway 重启蒸發，主进程零感知）；子专家 launch context 无主会话状态
+- **F3 边界感知**：launch context 注入"主会话锚点专家 = <slug>；只交付 Y 域
+  findings，不重复主进程工作；主对话不可见，持久上下文查 filemem/kbs"
+  （①② 通道共享，进子 agent 自身 context，主前缀零改动）
+- **F2 成果持久**：指示子专家完成时写 filemem（type=task, scope=day,
+  含 slug+任务原话+结论）→ 跨 gateway 重启成果可捞回（宿主注册表设计为
+  进程内驻留，重启即清——filemem 是架构内共享持久面；子专家工具面继承
+  父进程含 filemem，活体日志实证其已自取 filemem_search/kb_search_central）
+- **F4 接入指引**：recovered/lost 卡面写明"子专家独立完成，请采纳/核验而非
+  重做；持久副本 filemem 检索 slug=<slug> + 时间窗，审计键 delegation_id"

@@ -472,7 +472,12 @@ def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[st
                 summary = str(getattr(result, "summary", None) or "").strip()
                 if summary:
                     _log(session_id, "subagent-result-recovered", expert=slug, delegation_id=sid)
-                    pieces.append(f"## Sub-expert findings ({slug})\n{summary}")
+                    # v2.4.4 F4 接入指引: 主专家拿到成果时知道怎么用——采纳/核验, 不重做
+                    pieces.append(
+                        f"## Sub-expert findings ({slug})\n{summary}\n"
+                        f"（由子专家 {slug} 独立完成; 请采纳/核验而非重做。"
+                        f"持久副本（若已落盘）: filemem 检索 slug={slug} + 时间窗; 审计键 delegation_id={sid}）"
+                    )
                 else:
                     _log(session_id, "subagent-result-recovered", expert=slug,
                          delegation_id=sid, note="empty-summary")
@@ -526,14 +531,16 @@ def _probe_resolver(frozen: Any) -> Dict[str, str]:
 
 
 def _lost_pointer(slug: str, sid: str) -> str:
-    """v2.4.3: UNKNOWN 重试耗尽的诚实指针卡——主进程至少"接"到交代（append-only）。"""
+    """v2.4.3: UNKNOWN 重试耗尽的诚实指针卡——主进程至少"接"到交代（append-only）。
+    v2.4.4 F4: 加 filemem 持久副本检索指引 + 采纳不重做（F2 指示子专家落盘后跨重启可捞回）。"""
     return (
         f"## Sub-expert status ({slug})\n"
         f"Host subagent {sid}: result registry entry unavailable after "
         f"{_UNKNOWN_RETRY_CAP} polls (gateway restart cleared the in-process host registry, "
         f"or the host lifecycle context gate rejected the poll). Findings are NOT recoverable "
-        f"via the lifecycle API; the sub-expert ran in its own host subagent session — search "
-        f"host logs / supercompress / filemem by delegation id {sid}."
+        f"via the lifecycle API; the sub-expert ran in its own host subagent session. "
+        f"若其成果已落盘: filemem 检索 slug={slug} + 时间窗（审计键 delegation_id={sid}, "
+        f"宿主 agent.log/supercompress 亦可查）——找到请采纳/核验而非重做。"
     )
 
 
@@ -557,6 +564,14 @@ def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_mess
         f"2. 动手前自取持久上下文: 用 filemem_search 与 kb_search_central 查与本任务相关的 {category} 事实。",
         f'3. 任务（用户原话）: "{user_message}"',
         f"4. 最近对话语境（最近 2 轮 user 消息）:\n{_recent_history(conversation_history, 2)}",
+        # v2.4.4 F3 边界感知（主→子）: 子专家知道主进程状态, 不各做各的
+        f"5. 任务边界: 主会话锚点专家 = {st.anchor or '（无）'}（其 persona 已注入主进程上下文）。"
+        f"你只交付 {category} 域 findings，不重复主进程已在做的工作；"
+        f"主会话对话对你不可见，持久上下文以 filemem/kbs 自取为准。",
+        # v2.4.4 F2 成果持久（跨重启）: 宿主注册表随进程蒸發, filemem 是共享持久面
+        f"6. 成果持久化: 完成时把 findings 摘要（结论/关键证据/下一步）写入 filemem"
+        f"（type=task, scope=day），内容必须含: 专家 slug={slug}、用户任务原话、结论摘要。"
+        f"主进程/用户按 slug+时间窗检索复用——避免你的成果随宿主重启丢失。",
         "约束: 只交付 findings/结果，不做 git commit/push（git 归主进程）；"
         "你无法调用 delegate_task/clarify，用你手上有的工具完成。",
     ])
