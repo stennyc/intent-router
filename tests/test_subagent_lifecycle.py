@@ -19,10 +19,20 @@ Run: C:/tmp/cmap-venv/Scripts/python -m pytest tests/ -q   (pytest + stdlib only
 """
 import importlib.util
 import json
+import logging
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+_MANIFEST_PATH = Path(__file__).resolve().parents[1] / "plugin.yaml"
+
+
+def _manifest_version() -> str:
+    m = re.search(r'^\s*version:\s*["\']?([\w.\-]+)', _MANIFEST_PATH.read_text(encoding="utf-8"), re.M)
+    assert m is not None
+    return m.group(1)
 
 
 def _load_plugin():
@@ -358,3 +368,15 @@ def test_lifecycle_running_still_tracked_next_turn_no_action(env):
     assert r is None
     assert env.mod._SESSIONS["s1"].lifecycle, "running 子进程保留到下一轮"
     assert not [e for e in _events(env) if e["event"].startswith("subagent-result-")]
+
+
+def test_registration_line_version_follows_manifest(caplog):
+    """v2.4.2 收口：注册行版本号跟随 plugin.yaml manifest（此前硬编码字面量漂移，
+    活体 gateway 跑 v2.4.2 代码却打 v2.4.1 注册行 → 验收信号失真）。"""
+    ir = _load_plugin()
+    with caplog.at_level(logging.INFO):
+        ir.register(_FakeCtx())
+    ver = _manifest_version()
+    recs = [r for r in caplog.records if "registered" in r.getMessage()]
+    assert recs, "registration log line missing"
+    assert f"intent-router v{ver} registered" in recs[-1].getMessage(), recs[-1].getMessage()

@@ -774,7 +774,20 @@ def _make_hook(ctx: Any):
     return _intent_router_hook
 
 
+def _manifest_version() -> str:
+    """v2.4.2 收口：注册行版本号跟随 plugin.yaml manifest（不再硬编码字面量，
+    避免活体跑新代码却打旧版本注册行 → 验收信号失真）。fail-soft：读不到给 '?'。"""
+    try:
+        p = Path(__file__).with_name("plugin.yaml")
+        text = p.read_text(encoding="utf-8")
+        m = re.search(r'^\s*version:\s*["\']?([\w.\-]+)', text, re.M)
+        return m.group(1) if m else "?"
+    except Exception:
+        return "?"
+
+
 def register(ctx) -> None:
     """插件注册入口（宿主加载时调用一次）"""
     ctx.register_hook("pre_llm_call", _make_hook(ctx))
-    logger.info("intent-router v2.4.1 registered (anchor + sub-expert dispatch via subagent-lifecycle + card reinjection + /expert + anchor_inject + refused-observability + lifecycle-absent diagnostics)")
+    logger.info("intent-router v%s registered (anchor + sub-expert dispatch via subagent-lifecycle + card reinjection + /expert + anchor_inject + refused-observability + lifecycle-absent diagnostics)",
+                _manifest_version())
