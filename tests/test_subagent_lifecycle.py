@@ -516,13 +516,25 @@ def test_launch_context_carries_boundary_and_persistence(env):
 
 
 def test_channel_two_context_also_enriched(env):
-    """F3+F2 是共享 context_text: 通道②（delegate_task, CLI 模式）同样受益。"""
+    """F3+F2 是共享 context_text: 通道②（delegate_task, CLI 模式）同样受益。
+    通道① 被拒（raise_on_launch）→ 走通道②。不走 _dispatched（它断言 lifecycle 派发
+    事件, 与通道② 语义矛盾）; 直接驱动通道② 并校验共享 context_text 携带任务边界+持久化。"""
     svc = _FakeLifecycle()
     svc.raise_on_launch = RuntimeError("No active Hermes parent session is available.")
-    _dispatched(env, svc)
+    env.ctx.lifecycle_svc = svc
+    env.ctx.llm.scripts = [
+        {"category": "engineering", "confidence": 0.9},
+        {"category": "security", "confidence": 0.9},
+    ]
+    _turn(env, "帮我写个 REST 后端 API", first=True)
+    _turn(env, "做个安全审查", first=False)
     assert env.ctx.dispatch_calls, "通道① 不可用 → 通道② 接管"
     ctx_text = env.ctx.dispatch_calls[0][1]["tasks"][0]["context"]
     assert "任务边界" in ctx_text and "filemem" in ctx_text
+    evs = _events(env)
+    assert [e for e in evs if e["event"] == "lifecycle-unavailable"], evs
+    d = [e for e in evs if e["event"] == "dispatch" and e.get("channel") == "delegate_task"]
+    assert d and d[0]["delegation_id"].startswith("deleg_"), evs
 
 
 def test_recovered_card_directs_adopt_not_redo(env):
