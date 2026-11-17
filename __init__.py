@@ -165,7 +165,7 @@ _COMPLETION_ID_RE = re.compile(r"\[ASYNC DELEGATION (?:BATCH )?COMPLETE[^\]]*?([
 
 
 class _SessionState:
-    __slots__ = ("anchor", "running", "last_seen", "full_on_next")
+    __slots__ = ("anchor", "running", "last_seen", "full_on_next", "lifecycle")
 
     def __init__(self) -> None:
         self.anchor: Optional[str] = None
@@ -174,6 +174,9 @@ class _SessionState:
         self.last_seen: float = time.time()
         # v2.2: /expert 手动切换后，若专家标记不在上下文 → 下一次补注事件给全文（不给卡）
         self.full_on_next: bool = False
+        # v2.4: slug -> (subagent_id, handle_dict, dispatched_at) — 宿主
+        # subagent-lifecycle 通道派发的子专家（gateway 模式可用；结果经轮询恢复）
+        self.lifecycle: Dict[str, Tuple[str, Optional[dict], float]] = {}
 
 
 _SESSIONS: "OrderedDict[str, _SessionState]" = OrderedDict()
@@ -246,10 +249,12 @@ def _get_state(session_id: str) -> _SessionState:
 
 
 def _sweep_running(st: _SessionState) -> None:
-    """调用方须持有 _LOCK。完成消息丢失时的兜底：running 过期即放行重派。"""
+    """调用方须持有 _LOCK。完成消息丢失时的兜底：running/lifecycle 过期即放行重派。"""
     now = time.time()
     for slug in [s for s, (_d, ts) in st.running.items() if now - ts > _RUNNING_TTL]:
         del st.running[slug]
+    for slug in [s for s, (_d, _h, ts) in st.lifecycle.items() if now - ts > _RUNNING_TTL]:
+        del st.lifecycle[slug]
 
 
 # ── 结构化审计日志（fail-soft：日志故障绝不影响 hook） ────────────────────
@@ -329,23 +334,118 @@ def _recent_history(conversation_history: Any, n: int = 2, cap: int = 500) -> st
 
 
 def _join_ctx(*pieces: Optional[str]) -> Optional[str]:
-    """合并注入片（append-only，保持字节序稳定：reinject 在前、fallback 在后）。"""
+    """合并注入片（append-only，保持字节序稳定：reinject 在前、lifecycle findings 次之、fallback 最后）。"""
     out = "\n\n".join(p for p in pieces if p)
     return out or None
+
+
+def _get_lifecycle_service(ctx: Any) -> Any:
+    """v2.4 通道①: 宿主 PluginContext.subagent_lifecycle()（SubagentLifecycleService）。
+    旧宿主/测试 ctx 无此 API → None（走旧通道，零行为变化）。"""
+    try:
+        factory = getattr(ctx, "subagent_lifecycle", None)
+        if not callable(factory):
+            return None
+        return factory() or None
+    except Exception:
+        return None
+
+
+def _handle_to_dict(handle: Any) -> Optional[dict]:
+    try:
+        d = handle.to_dict()
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _lifecycle_dispatch(ctx: Any, st: _SessionState, session_id: str,
+                       goal: str, context_text: str, category: str, slug: str,
+                       confidence: float, expert_path: Path) -> Optional[str]:
+    """通道①: ctx.subagent_lifecycle().launch(...)。宿主 turn facade 每轮把父 agent
+    bind 进 contextvar（gateway 模式 _cli_ref=None 时 dispatch_tool 拿不到 parent, 此通道可用）。
+    launch 接受 Mapping（宿主 _coerce_request）；返回 SubagentHandle(subagent_id, to_dict)。
+    结果不产生 [ASYNC DELEGATION] 重入（宿主重入通知只在 delegate_task 派发层注册）
+    → 轮询 _poll_lifecycle 是结果交付的唯一通道。成功返回 subagent_id, 不可用返回 None。"""
+    svc = _get_lifecycle_service(ctx)
+    if svc is None:
+        return None
+    try:
+        handle = svc.launch({"goal": goal, "context": context_text, "role": "leaf"})
+        sid = str(getattr(handle, "subagent_id", "") or "")
+        if not sid:
+            raise RuntimeError("lifecycle handle missing subagent_id")
+    except Exception as e:
+        _log(session_id, "lifecycle-unavailable", expert=slug, error=str(e)[:300])
+        return None
+    with _LOCK:
+        _sweep_running(st)
+        st.lifecycle[slug] = (sid, _handle_to_dict(handle), time.time())
+    _log(session_id, "dispatch", category=category, expert=slug, confidence=confidence,
+         delegation_id=sid, channel="subagent_lifecycle", expert_path=str(expert_path))
+    return sid
+
+
+def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[str]:
+    """v2.4: 轮询 lifecycle 通道子专家, 完成即把 findings append 进本轮 context（缓存安全）。
+    非终态保留; UNKNOWN（handle 失踪, 如 gateway 重启）清账不卡死。"""
+    if not st.lifecycle:
+        return None
+    svc = _get_lifecycle_service(ctx)
+    if svc is None:
+        return None
+    pieces: list[str] = []
+    with _LOCK:
+        _sweep_running(st)
+        pending = list(st.lifecycle.items())
+    for slug, (sid, hdict, _ts) in pending:
+        if hdict is None:
+            continue
+        status: Any = None
+        try:
+            status = svc.status(hdict)
+        except Exception:
+            status = None
+        state = str(getattr(status, "state", "UNKNOWN") or "UNKNOWN")
+        if state in ("RUNNING", "PENDING", "STARTING", "CANCEL_REQUESTED"):
+            continue
+        result: Any = None
+        if state in ("SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED"):
+            try:
+                result = svc.result(hdict)
+            except Exception:
+                result = None
+        with _LOCK:
+            st.lifecycle.pop(slug, None)
+        if state == "SUCCEEDED":
+            summary = str(getattr(result, "summary", None) or "").strip()
+            if summary:
+                _log(session_id, "subagent-result-recovered", expert=slug, delegation_id=sid)
+                pieces.append(f"## Sub-expert findings ({slug})\n{summary}")
+            else:
+                _log(session_id, "subagent-result-recovered", expert=slug,
+                     delegation_id=sid, note="empty-summary")
+        elif state in ("FAILED", "INTERRUPTED", "CANCELLED"):
+            err = str(getattr(result, "error_message", None)
+                      or getattr(result, "error_classification", None) or state)
+            _log(session_id, "subagent-result-failed", expert=slug, delegation_id=sid,
+                 state=state, error=err[:300])
+        else:  # UNKNOWN 等: handle 失踪（注册表随进程重启丢失）
+            _log(session_id, "subagent-result-lost", expert=slug, delegation_id=sid,
+                 note="unknown-handle")
+    return "\n\n".join(pieces) if pieces else None
 
 
 def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_message: str,
                          conversation_history: Any, category: str, slug: str,
                          confidence: float) -> Tuple[Optional[str], Optional[str]]:
-    """派发 Y 域子专家。v2.4 通道与降级（owner 裁决 2026-11-17: 宿主只读，改动仅落插件层）:
-    - 通道② (本函数当前主体): ctx.dispatch_tool("delegate_task") — 宿主在 gateway 模式下
-      无法附 parent agent，delegate_task 返回 tool_error JSON（'{"error": ...}'）。
-      旧行为把拒绝误记为 "dispatch"（delegation_id=null 假派发，2026-11-17 实证 23 条）。
-      现在: 拒绝记 "dispatch-refused"（不污染 running、不发假 dispatch）；
-      双通道全拒且专家正文可得 → 降级 in-session 注入（programming value 不丢）
-      → "dispatch-fallback-injection"。
-    - 通道① ctx.subagent_lifecycle().launch(...) 与结果轮询见 _poll_lifecycle/_lifecycle_dispatch。
-    返回 (delegation_id, fallback_context): 成功 → (id, None)；拒绝且有正文 → (None, 注入文本)。
+    """派发 Y 域子专家。v2.4 通道顺序（owner 裁决 2026-11-17: 宿主只读，改动仅落插件层）:
+    ① _lifecycle_dispatch — 宿主 subagent-lifecycle 服务（gateway 模式可用；父 agent 由宿主
+       每轮 contextvar bind, 不依赖 _cli_ref）→ 返回 subagent_id, 结果经 _poll_lifecycle 恢复。
+    ② 本函数主体 — ctx.dispatch_tool("delegate_task")（CLI 模式; gateway 模式返回
+       tool_error JSON → 记 "dispatch-refused" 而非假 "dispatch", 不污染 running）。
+    ③ 全拒且专家正文可得 → 降级 in-session 注入（"dispatch-fallback-injection"）。
+    返回 (delegation_id, fallback_context): 成功 → (id, None)；全拒且有正文 → (None, 注入文本)。
     不传 toolsets → 子代理继承父工具面，含 filemem + knowledge-base-search
     （已核实 DELEGATE_BLOCKED_TOOLS 不覆盖这两组）。"""
     expert_path = _EXPERTS_DIR / f"{slug}.md"
@@ -359,6 +459,12 @@ def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_mess
         "约束: 只交付 findings/结果，不做 git commit/push（git 归主进程）；"
         "你无法调用 delegate_task/clarify，用你手上有的工具完成。",
     ])
+    # ① subagent-lifecycle 通道（gateway 模式）: 成功即真子 agent 已起, 返回关联 id
+    sid = _lifecycle_dispatch(ctx, st, session_id, goal, context_text,
+                             category, slug, confidence, expert_path)
+    if sid is not None:
+        return sid, None
+    # ② 旧通道 delegate_task
     args = {"tasks": [{"goal": goal, "context": context_text}]}
     try:
         raw = ctx.dispatch_tool("delegate_task", args)
@@ -390,6 +496,7 @@ def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_mess
     if error_text is None:
         error_text = f"unparseable result: {str(raw)[:200]}"
     _log(session_id, "dispatch-refused", expert=slug, channel="delegate_task", error=error_text[:300])
+    # ③ 降级 in-session 注入（programming value 不丢）
     body = _load_expert_context(slug)
     if body:
         _log(session_id, "dispatch-fallback-injection", expert=slug, confidence=confidence)
@@ -621,6 +728,7 @@ def _make_hook(ctx: Any):
             return {"context": _wrap_injection(category, slug, content)}
 
         # ── 后续轮: 压缩补注（事件驱动）+ 新域检测（v2 零注入不变量不变） ──
+        lifecycle_ctx = _poll_lifecycle(ctx, st, session_id)   # v2.4: lifecycle 通道子专家 findings
         reinject_ctx = _reinject_after_compaction(st, session_id, conversation_history)
         category, confidence = _classify(ctx, msg)
         slug = None
@@ -628,18 +736,20 @@ def _make_hook(ctx: Any):
             slug = CATEGORY_MAP.get(category)
         if slug is None or slug == st.anchor:
             # 仍在锚点域 / 无新域 → 不派发；压缩事件轮仍补注（尾部加法，缓存安全）
-            return {"context": reinject_ctx} if reinject_ctx else None
+            ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx)
+            return {"context": ctx_out} if ctx_out else None
         # 走到这里 ⇒ slug 有效且 ≠ 锚点 ⇒ category 必非 None（slug 由它派生）
         assert category is not None
         with _LOCK:
             _sweep_running(st)
             if slug in st.running:
                 _log(session_id, "skip-running", category=category, expert=slug)
-                return {"context": reinject_ctx} if reinject_ctx else None
+                ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx)
+                return {"context": ctx_out} if ctx_out else None
         _deleg_id, fallback_ctx = _dispatch_sub_expert(ctx, st, session_id, msg,
                                                         conversation_history,
                                                         category, slug, confidence)
-        ctx_out = _join_ctx(reinject_ctx, fallback_ctx)
+        ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx, fallback_ctx)
         return {"context": ctx_out} if ctx_out else None
 
     return _intent_router_hook
