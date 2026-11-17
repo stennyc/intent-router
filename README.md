@@ -163,3 +163,29 @@ fail-soft：配置读取异常/宿主无 get_config → 按 true 处理（行为
 审计日志新增事件：`anchor-disabled`。
 
 测试：`tests/test_anchor_inject_config.py`（4 用例：off 跳过首轮 / off 无锚点派发保留 / off 下 /expert 仍可锚定 / 缺省回归）。
+
+## v2.4（2026-11-17，子专家真派发修复 — owner 裁决"宿主只读、改动仅落插件层"）
+
+背景：2026-11-17 日志实证（coder profile）当日 23 条 `dispatch` 事件全部
+`delegation_id=null` 且零子 agent 实际生成——**假派发**。根因（宿主只读勘察）：
+gateway 模式下 `PluginManager._cli_ref=None`，`ctx.dispatch_tool("delegate_task")`
+无法附 parent agent，宿主 `delegate_task` 返回 tool_error JSON
+（`tools/registry.py::tool_error`），旧代码把拒绝误记为成功 `dispatch`。
+
+修复（通道顺序，插件侧）：
+
+| 通道 | 机制 | 适用 |
+|---|---|---|
+| ① subagent-lifecycle | `ctx.subagent_lifecycle().launch({goal, context, role})`（宿主 SubagentLifecycleService；父 agent 由宿主 turn facade 每轮 contextvar bind，hook 线程经 copy_context 继承——已实证）。返回 SubagentHandle(subagent_id) 作关联 id | **gateway 模式（桌面）** |
+| ② delegate_task 旧通道 | `ctx.dispatch_tool("delegate_task")`，成功记 `dispatch(channel=delegate_task)`；拒绝记 `dispatch-refused`（不污染 running） | CLI 模式 |
+| ③ 降级 in-session 注入 | 双通道全拒且专家正文可得 → 专家全文当轮注入，记 `dispatch-fallback-injection` | 兜底 |
+
+结果交付：lifecycle 子进程不注册宿主重入通知（重入只在 delegate_task 派发层）
+→ 后续 `pre_llm_call` 轮询 `status/result`，完成即 findings append 注入：
+
+- `subagent-result-recovered`（SUCCEEDED，findings 进 context，缓存安全）
+- `subagent-result-failed`（FAILED/INTERRUPTED/CANCELLED）
+- `subagent-result-lost`（UNKNOWN handle，如 gateway 重启后注册表丢失；清账不卡死）
+
+零回归保证：旧宿主/无 lifecycle API 的 ctx → 行为与 v2.3 完全一致（测试钉死）。
+测试：`tests/test_dispatch_refused.py`（5 用例）+ `tests/test_subagent_lifecycle.py`（7 用例），全量 54 passed。
