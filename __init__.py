@@ -184,7 +184,8 @@ _COMPLETION_ID_RE = re.compile(r"\[ASYNC DELEGATION (?:BATCH )?COMPLETE[^\]]*?([
 
 
 class _SessionState:
-    __slots__ = ("anchor", "running", "last_seen", "full_on_next", "lifecycle", "guard_logged")
+    __slots__ = ("anchor", "running", "last_seen", "full_on_next", "lifecycle",
+                 "guard_logged", "guarded", "pending", "ledger_due", "fallback_due")
 
     def __init__(self) -> None:
         self.anchor: Optional[str] = None
@@ -201,6 +202,17 @@ class _SessionState:
         self.lifecycle: Dict[str, tuple] = {}
         # v2.5.1 P0: subagent-guard 审计节流（每 session 记一次, 防多 API-call 子专家刷 jsonl）
         self.guard_logged: bool = False
+        # v2.6 P1（launch_timing=post）: 子 agent session 标记（pre 守卫打标, post 面双信号之一）
+        self.guarded: bool = False
+        # v2.6 P1: post 模式 pending 派发 {slug: (category, confidence, task_label,
+        # goal, context_text, expert_path)} —— pre 轮只记账, post_llm_call 真 launch
+        self.pending: Dict[str, tuple] = {}
+        # v2.6 P1: post 模式 launch 成功后, 台账卡顺延到下一 pre 轮注入
+        # {slug: (delegation_id, task_label, channel)}
+        self.ledger_due: Dict[str, tuple] = {}
+        # v2.6 P1: post 模式全拒, 降级专家全文注入顺延到下一 pre 轮
+        # {slug: (confidence, task_label, category)}
+        self.fallback_due: Dict[str, tuple] = {}
 
 
 _SESSIONS: "OrderedDict[str, _SessionState]" = OrderedDict()
@@ -381,11 +393,15 @@ def _task_label(user_message: str, cap: int = 80) -> str:
     return " ".join(str(user_message or "").split())[:cap]
 
 
-def _ledger_card(slug: str, task_label: str, deleg_id: str, channel: str) -> str:
-    """L1+L4: 派发成功同轮台账卡——主专家从开工第一秒知道分工（append-only）。"""
+def _ledger_card(slug: str, task_label: str, deleg_id: str, channel: str,
+                 post: bool = False) -> str:
+    """L1+L4: 派发成功同轮台账卡——主专家从开工第一秒知道分工（append-only）。
+    v2.6 post 模式: launch 发生在主专家回复之后 → 台账卡顺延一轮, 文案标明
+    "上轮回复后已启动"（分序倒转的显性化, 主专家知道时序而非误以为并行）。"""
+    timing_note = "上轮回复后已启动; " if post else ""
     return (
         f"## 分工台账（进行中）\n"
-        f"子专家 {slug} 已接手: “{task_label}”（delegation_id={deleg_id}, channel={channel}）\n"
+        f"子专家 {slug} 已接手: “{task_label}”（{timing_note}delegation_id={deleg_id}, channel={channel}）\n"
         f"- 此项由子专家处理中: 主进程勿重复该项工作\n"
         f"- 完成后 findings 自动送达（下一轮自动追加 / 完成消息重入）"
     )
@@ -614,19 +630,11 @@ def _probe_resolver(frozen: Any) -> Dict[str, str]:
     return {"resolver_session": cur, "frozen_session": frz}
 
 
-def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_message: str,
-                         conversation_history: Any, category: str, slug: str,
-                         confidence: float) -> Tuple[Optional[str], Optional[str]]:
-    """派发 Y 域子专家。v2.4 通道顺序（owner 裁决 2026-11-17: 宿主只读，改动仅落插件层）:
-    ① _lifecycle_dispatch — 宿主 subagent-lifecycle 服务（gateway 模式可用；父 agent 由宿主
-       每轮 contextvar bind, 不依赖 _cli_ref）→ 返回 subagent_id, 结果经 _poll_lifecycle 恢复。
-    ② 本函数主体 — ctx.dispatch_tool("delegate_task")（CLI 模式; gateway 模式返回
-       tool_error JSON → 记 "dispatch-refused" 而非假 "dispatch", 不污染 running）。
-    ③ 全拒且专家正文可得 → 降级 in-session 注入（"dispatch-fallback-injection"）。
-    返回 (delegation_id, dispatch_turn_context): 成功 → (id, v2.5 L1 台账卡, 主专家
-    开工第一秒知道分工); 全拒且有正文 → (None, 注入文本)。
-    不传 toolsets → 子代理继承父工具面，含 filemem + knowledge-base-search
-    （已核实 DELEGATE_BLOCKED_TOOLS 不覆盖这两组）。"""
+def _build_dispatch_inputs(st: _SessionState, slug: str, user_message: str,
+                           conversation_history: Any, category: str):
+    """v2.6: 组装 5 项 launch 输入 (expert_path, goal, context_text, task_label)——
+    pre 模式（当轮派发）与 post 模式（pending 记账, post_llm_call 真 launch）共用,
+    字节序单一来源（F3 边界感知 / F2 成果持久指令不变）。"""
     expert_path = _EXPERTS_DIR / f"{slug}.md"
     task_label = _task_label(user_message)      # v2.5: 台账/提醒卡的任务标签（单行截断）
     goal = f"作为 {category} 领域专家（{slug}）执行以下任务，只交付 findings/结果。"
@@ -647,13 +655,23 @@ def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_mess
         "约束: 只交付 findings/结果，不做 git commit/push（git 归主进程）；"
         "你无法调用 delegate_task/clarify，用你手上有的工具完成。",
     ])
-    # ① subagent-lifecycle 通道（gateway 模式）: 成功即真子 agent 已起, 返回关联 id
+    return expert_path, goal, context_text, task_label
+
+
+def _launch_via_channels(ctx: Any, st: _SessionState, session_id: str, slug: str,
+                         category: str, confidence: float, goal: str, context_text: str,
+                         expert_path: Path, task_label: str) -> Tuple[Optional[str], str]:
+    """v2.6 P1: launch 通道序列核心（① lifecycle → ② delegate_task），pre/post 共用单一来源。
+    返回 (delegation_id, channel):
+      成功 → (id, "subagent_lifecycle"|"delegate_task")——通道内已做 running/lifecycle 记账 + dispatch 事件；
+      全拒 → (None, "refused")——dispatch-refused 已记审计，由调用方决定降级面（pre=当轮注入 / post=fallback_due）；
+      宿主工具面故障（异常）→ (None, "error")——dispatch-error 已记，不做降级（语义不变）。"""
+    # ① subagent-lifecycle 通道（gateway 模式）: 成功即真子 agent 已起
     sid = _lifecycle_dispatch(ctx, st, session_id, goal, context_text,
                              category, slug, confidence, expert_path, task_label)
     if sid is not None:
-        # v2.5 L1+L4: 成功同轮台账卡——主专家从开工第一秒知道分工（勿重复 + 审计键）
-        return sid, _ledger_card(slug, task_label, sid, "subagent_lifecycle")
-    # ② 旧通道 delegate_task
+        return sid, "subagent_lifecycle"
+    # ② 旧通道 delegate_task（CLI 模式; gateway 模式返回 tool_error → 记 refused）
     args = {"tasks": [{"goal": goal, "context": context_text}]}
     try:
         raw = ctx.dispatch_tool("delegate_task", args)
@@ -661,7 +679,7 @@ def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_mess
         # 宿主工具面本身故障（区别于"返回拒绝"）: 保留 dispatch-error 语义, 不做降级注入
         logger.error(f"intent-router: sub-expert dispatch failed: {e}")
         _log(session_id, "dispatch-error", expert=slug, error=str(e))
-        return None, None
+        return None, "error"
     parsed: Any = None
     try:
         parsed = json.loads(raw) if isinstance(raw, str) else raw
@@ -680,18 +698,77 @@ def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_mess
             st.running[slug] = (deleg_id, time.time())
         _log(session_id, "dispatch", category=category, expert=slug, confidence=confidence,
              delegation_id=deleg_id, channel="delegate_task", expert_path=str(expert_path))
-        # v2.5 L1+L4: 通道② 成功同轮台账卡（结果经 [ASYNC DELEGATION] 重入送达）
-        return deleg_id, _ledger_card(slug, task_label, deleg_id, "delegate_task")
+        return deleg_id, "delegate_task"
     # 拒绝（tool_error JSON / 不可解析）→ 拒绝事实入审计；running 不动，避免假 running 卡住重派
     if error_text is None:
         error_text = f"unparseable result: {str(raw)[:200]}"
     _log(session_id, "dispatch-refused", expert=slug, channel="delegate_task", error=error_text[:300])
-    # ③ 降级 in-session 注入（programming value 不丢）
-    body = _load_expert_context(slug)
-    if body:
-        _log(session_id, "dispatch-fallback-injection", expert=slug, confidence=confidence)
-        return None, _wrap_injection(category, slug, body)
-    return None, None
+    return None, "refused"
+
+
+def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_message: str,
+                         conversation_history: Any, category: str, slug: str,
+                         confidence: float) -> Tuple[Optional[str], Optional[str]]:
+    """派发 Y 域子专家（pre 模式, 当轮真派发）。v2.4 通道顺序（owner 裁决 2026-11-17: 宿主只读，
+    改动仅落插件层）: ①②③ 语义见 _launch_via_channels + 本函数降级面。
+    返回 (delegation_id, dispatch_turn_context): 成功 → (id, v2.5 L1 台账卡, 主专家
+    开工第一秒知道分工); 全拒且有正文 → (None, 降级注入文本)。
+    不传 toolsets → 子代理继承父工具面，含 filemem + knowledge-base-search
+    （已核实 DELEGATE_BLOCKED_TOOLS 不覆盖这两组）。"""
+    expert_path, goal, context_text, task_label = _build_dispatch_inputs(
+        st, slug, user_message, conversation_history, category)
+    deleg_id, channel = _launch_via_channels(ctx, st, session_id, slug, category, confidence,
+                                              goal, context_text, expert_path, task_label)
+    if channel in ("subagent_lifecycle", "delegate_task"):
+        assert deleg_id is not None    # 成功通道必带关联 id（_launch_via_channels 契约）
+        # v2.5 L1+L4: 成功同轮台账卡——主专家从开工第一秒知道分工（勿重复 + 审计键）
+        return deleg_id, _ledger_card(slug, task_label, deleg_id, channel)
+    if channel == "refused":
+        # ③ 降级 in-session 注入（programming value 不丢）
+        body = _load_expert_context(slug)
+        if body:
+            _log(session_id, "dispatch-fallback-injection", expert=slug, confidence=confidence)
+            return None, _wrap_injection(category, slug, body)
+        return None, None
+    return None, None    # channel == "error": 宿主工具面故障, 不做降级（语义不变）
+
+
+# ── v2.6 P1: post 模式顺延面（台账卡 / 降级注入在下一 pre 轮交付） ─────────
+
+def _consume_ledger_due(st: _SessionState, session_id: str) -> Optional[str]:
+    """v2.6: post 模式 launch 成功的台账卡（post_llm_call 记账, 下一 pre 轮交付;
+    pre 模式恒空 → 零行为变化）。append-only, 卡片字节序稳定。"""
+    if not st.ledger_due:
+        return None
+    with _LOCK:
+        items = list(st.ledger_due.items())
+        for slug, _v in items:
+            st.ledger_due.pop(slug, None)
+    pieces = []
+    for slug, (deleg_id, task_label, channel) in items:
+        _log(session_id, "ledger-post-inject", expert=slug,
+             delegation_id=deleg_id, channel=channel)
+        pieces.append(_ledger_card(slug, task_label, deleg_id, channel, post=True))
+    return "\n\n".join(pieces) if pieces else None
+
+
+def _consume_fallback_due(st: _SessionState, session_id: str) -> Optional[str]:
+    """v2.6: post 模式全拒的降级专家全文注入（post_llm_call 记账, 下一 pre 轮交付;
+    programming value 不丢, 时延一轮。pre 模式恒空 → 零行为变化）。"""
+    if not st.fallback_due:
+        return None
+    with _LOCK:
+        items = list(st.fallback_due.items())
+        for slug, _v in items:
+            st.fallback_due.pop(slug, None)
+    pieces = []
+    for slug, (confidence, task_label, category) in items:
+        body = _load_expert_context(slug)
+        if body:
+            _log(session_id, "dispatch-fallback-injection", expert=slug,
+                 confidence=confidence, note="post-deferred")
+            pieces.append(_wrap_injection(category, slug, body))
+    return "\n\n".join(pieces) if pieces else None
 
 
 # ── 完成消息重入处理（循环守卫） ────────────────────────────────────────────
@@ -823,6 +900,22 @@ def _anchor_inject_enabled(ctx: Any) -> bool:
         return True   # 宿主无 get_config / 配置损坏 → 保守保持自动锚点
 
 
+# ── launch_timing 分序开关（v2.6 P1, owner 裁决 2026-11-17 "时序做"）────────
+# pre（缺省）: 现状——pre_llm_call 分类即真 launch（主/子并行, 延迟重叠）。
+# post: 治"主专家还没准备好/分工, 子专家先被拉起"的时序倒置——pre 轮只记
+# pending, 宿主 post_llm_call（主专家回复之后）才真 launch; 台账卡/降级注入
+# 顺延到下一 pre 轮。全部 append-only, 前缀缓存不变量不变。
+
+def _launch_timing(ctx: Any) -> str:
+    """读 launch_timing 配置（"pre"|"post"）。缺省/异常 = "pre"（fail-soft,
+    旧宿主无 get_config → 零行为变化）。"""
+    try:
+        v = str(ctx.get_config("launch_timing", "pre") or "pre").lower()
+    except Exception:
+        return "pre"
+    return v if v in ("pre", "post") else "pre"
+
+
 # ── /expert 手动覆盖（v2.2, owner 裁决 2026-11-17 "继续完成"） ─────────────
 # 宿主 veto 通道（turn_context.py: {"action":"block"} → 该轮终止、不进推理、不烧分类）:
 #   /expert <category|slug>  切锚点（专家不在场 → 下一轮补全文；已在场 → 只切不注）
@@ -897,6 +990,7 @@ def _make_hook(ctx: Any):
             if not st.guard_logged:
                 st.guard_logged = True
                 _log(session_id, "subagent-guard")
+            st.guarded = True   # v2.6 P1: 子 session 标记（post 面双信号之一, 防 pending 误派发）
             return None
 
         # 0.5) 循环守卫: 合成完成轮 → 清 running + 跳过检测
@@ -938,12 +1032,40 @@ def _make_hook(ctx: Any):
         slug = None
         if category is not None and confidence >= _CONFIDENCE_GATE:
             slug = CATEGORY_MAP.get(category)
+        # v2.6 P1: 分序面——pre（缺省, 零变化）/ post（launch 顺延到 post_llm_call）；
+        # post 模式下本轮先消费上轮 post 记账的顺延卡（台账 / 降级注入, 尾部 append-only）
+        timing = _launch_timing(ctx)
+        due_ctx = (_join_ctx(_consume_ledger_due(st, session_id),
+                             _consume_fallback_due(st, session_id))
+                   if timing == "post" else None)
         if slug is None or slug == st.anchor:
             # 仍在锚点域 / 无新域 → 不派发；压缩事件轮仍补注（尾部加法，缓存安全）
-            ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx)
+            ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx, due_ctx)
             return {"context": ctx_out} if ctx_out else None
         # 走到这里 ⇒ slug 有效且 ≠ 锚点 ⇒ category 必非 None（slug 由它派生）
         assert category is not None
+        if timing == "post":
+            # v2.6 P1: post 模式 pre 轮不真派发——记账 pending（宿主 post_llm_call 真 launch）；
+            # 台账卡 / 降级注入顺延到下一 pre 轮（due_ctx 已在上方消费）
+            with _LOCK:
+                _sweep_running(st)
+                if slug in st.running:
+                    _log(session_id, "skip-running", category=category, expert=slug)
+                    ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx, due_ctx)
+                    return {"context": ctx_out} if ctx_out else None
+                if slug in st.pending:
+                    _log(session_id, "skip-pending", category=category, expert=slug)
+                    ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx, due_ctx)
+                    return {"context": ctx_out} if ctx_out else None
+            expert_path, goal, context_text, task_label = _build_dispatch_inputs(
+                st, slug, msg, conversation_history, category)
+            with _LOCK:
+                st.pending[slug] = (category, confidence, task_label, goal, context_text,
+                                    expert_path)
+            _log(session_id, "dispatch-pending", category=category, expert=slug,
+                 confidence=confidence)
+            ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx, due_ctx)
+            return {"context": ctx_out} if ctx_out else None
         with _LOCK:
             _sweep_running(st)
             if slug in st.running:
@@ -961,6 +1083,60 @@ def _make_hook(ctx: Any):
     return _intent_router_hook
 
 
+def _launch_pending(ctx: Any, st: _SessionState, session_id: str, slug: str,
+                    category: str, confidence: float, task_label: str, goal: str,
+                    context_text: str, expert_path: Path) -> None:
+    """v2.6 P1: post 模式真 launch（post_llm_call 内执行; 通道序列与 pre 共用
+    _launch_via_channels 单一来源）。结果面顺延到下一 pre 轮:
+    成功 → ledger_due（台账卡, post 变体文案"上轮回复后已启动"）;
+    全拒 → fallback_due（降级专家全文注入, 时延一轮, programming value 不丢）;
+    宿主工具面故障（error）→ 不降级（dispatch-error 语义, 与 pre 一致）。"""
+    deleg_id, channel = _launch_via_channels(ctx, st, session_id, slug, category, confidence,
+                                              goal, context_text, expert_path, task_label)
+    if channel in ("subagent_lifecycle", "delegate_task"):
+        assert deleg_id is not None
+        st.ledger_due[slug] = (deleg_id, task_label, channel)
+    elif channel == "refused":
+        st.fallback_due[slug] = (confidence, task_label, category)
+
+
+def _make_post_hook(ctx: Any):
+    """v2.6 P1: post_llm_call hook——launch_timing=post 时主专家回复之后真 launch。
+
+    宿主实证（2026-11-17 只读）: post_llm_call 每 turn 一次（turn_finalizer.py,
+    tool loop 结束后）, kwargs 带 session_id/user_message/assistant_response/
+    conversation_history/model/platform（无 parent_session_id）; worker 线程经
+    copy_context 继承 → 父 agent contextvar 绑定与 pre 时刻等价（v2.4.3 B 冻结
+    快照机制直接适用）; ∈ _HOOK_TIMEOUT_BOUNDED_HOOKS（30s 界内, fail-open）。
+
+    三重 no-op 门（缺省 pre 模式零开销）:
+      ① 子 agent session（platform=="subagent" 或 st.guarded——pre 守卫打标）
+         → 对称 P0: 子 session 的 post 轮不得执行 pending 派发
+      ② launch_timing != "post"（缺省 pre / 旧宿主无 get_config）→ no-op
+      ③ pending 空 → no-op
+    """
+
+    def _post_hook(session_id: str, user_message: Any = None,
+                   assistant_response: Any = None, **kwargs: Any) -> Optional[Dict[str, str]]:
+        st = _get_state(session_id)
+        if str(kwargs.get("platform") or "") == "subagent" or st.guarded:
+            return None
+        if _launch_timing(ctx) != "post":
+            return None
+        with _LOCK:
+            items = list(st.pending.items())
+            for slug, _v in items:
+                st.pending.pop(slug, None)
+        if not items:
+            return None
+        for slug, (category, confidence, task_label, goal, context_text, expert_path) in items:
+            _launch_pending(ctx, st, session_id, slug, category, confidence,
+                            task_label, goal, context_text, expert_path)
+        return None
+
+    return _post_hook
+
+
 def _manifest_version() -> str:
     """v2.4.2 收口：注册行版本号跟随 plugin.yaml manifest（不再硬编码字面量，
     避免活体跑新代码却打旧版本注册行 → 验收信号失真）。fail-soft：读不到给 '?'。"""
@@ -976,5 +1152,8 @@ def _manifest_version() -> str:
 def register(ctx) -> None:
     """插件注册入口（宿主加载时调用一次）"""
     ctx.register_hook("pre_llm_call", _make_hook(ctx))
-    logger.info("intent-router v%s registered (anchor + sub-expert dispatch via subagent-lifecycle + delegation-ledger + card reinjection + /expert + anchor_inject + refused-observability + lifecycle-absent diagnostics)",
+    # v2.6 P1: post_llm_call（launch_timing=post 时主专家回复后真 launch;
+    # 缺省 pre 模式三重 no-op 门, 零行为变化）
+    ctx.register_hook("post_llm_call", _make_post_hook(ctx))
+    logger.info("intent-router v%s registered (anchor + sub-expert dispatch via subagent-lifecycle + delegation-ledger + card reinjection + /expert + anchor_inject + refused-observability + lifecycle-absent diagnostics + launch-timing post)",
                 _manifest_version())

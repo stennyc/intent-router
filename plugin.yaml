@@ -1,6 +1,6 @@
 name: intent-router
-version: "2.5.1"
-description: 动态专家上下文路由 v2.5.1 — 锚点专家固定注入 + 新领域子专家派发（宿主 subagent-lifecycle 通道, gateway 模式真子 agent + 结果轮询交付）+ 分工台账（派发同轮台账卡 + 运行期提醒 + 终态交接卡, 主专家全程知道子专家在做什么）+ 平台守卫（子 agent session 回合短路, 防错误专家注入 + 孙代级联）+ 旧通道拒绝观测 + 降级注入 + lifecycle-absent 诊断 + 压缩后蒸馏卡补注 + /expert 手动覆盖 + anchor_inject 配置开关
+version: "2.6.0"
+description: "动态专家上下文路由 v2.6.0 — 锚点专家固定注入 + 新领域子专家派发（宿主 subagent-lifecycle 通道, gateway 模式真子 agent + 结果轮询交付）+ 分工台账（派发同轮台账卡 + 运行期提醒 + 终态交接卡, 主专家全程知道子专家在做什么）+ 平台守卫（子 agent session 回合短路, 防错误专家注入 + 孙代级联）+ 旧通道拒绝观测 + 降级注入 + lifecycle-absent 诊断 + 压缩后蒸馏卡补注 + /expert 手动覆盖 + anchor_inject/launch_timing 配置开关（v2.6 launch_timing=post 时真 launch 顺延到 post_llm_call, 治主专家未分工子专家先起的时序倒置; 缺省 pre 零行为变化）"
 author: hermes-agent
 license: MIT
 config_schema:
@@ -8,3 +8,7 @@ config_schema:
     type: bool
     default: true
     description: 首轮自动锚点注入开关。profile 的 SOUL.md 已含专家 persona（域 profile）时设 false：跳过首轮分类+注入（免重复+免稀释），/expert 手动切换不受影响。
+  launch_timing:
+    type: string
+    default: pre
+    description: "子专家真 launch 时序。pre（缺省）= pre_llm_call 当轮真派发（主/子并行, 延迟重叠）；post = pre 轮只记 pending, 主专家回复后 post_llm_call 才真 launch（台账卡/降级注入顺延下一轮）。post 模式 pre 侧零派发、零台账, 缺省行为与 pre 完全一致。"
