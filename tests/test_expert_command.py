@@ -168,7 +168,7 @@ def test_expert_clear_resets_anchor(env):
     assert _sessions(env)["s1"].anchor is None
     env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
     r2 = _turn(env, "再加个单元测试", first=False, history=[_user_msg("y")])
-    assert r2 is None                                        # 无锚点 → 无补注
+    assert r2 is not None and "分工台账" in r2["context"]   # v2.5 L1: 无锚点 → 无补注（意图不变）; 派发轮出台账卡
 
 
 def test_expert_invalid_no_state_change(env):

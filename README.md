@@ -228,3 +228,29 @@ gateway 模式下 `PluginManager._cli_ref=None`，`ctx.dispatch_tool("delegate_t
   父进程含 filemem，活体日志实证其已自取 filemem_search/kb_search_central）
 - **F4 接入指引**：recovered/lost 卡面写明"子专家独立完成，请采纳/核验而非
   重做；持久副本 filemem 检索 slug=<slug> + 时间窗，审计键 delegation_id"
+
+## v2.5（2026-11-17，分工台账——主专家全程知道子专家在做什么）
+- 背景：v2.4.x 修了"成果可达 + 不重做"，但"开工可见性"一直缺——派发发生在主 LLM
+  处理消息之前，主专家零感知子专家已接手哪项任务（各做各的起点）；RUNNING 期间
+  poll 静默 → 持续零感知；交接被动且有窗口。owner 裁决"动手"补全分工面。
+  全部 append-only 尾部加法（前缀缓存不变量不变，`test_prefix_cache_stable` 的
+  字节扩展检查继续钉死）。
+- **L1 派发同轮台账卡**：派发成功那一轮注入 `## 分工台账（进行中）`（子专家
+  slug + 任务标签 + delegation_id 审计键 + "主进程勿重复该项"）——主专家从
+  开工第一秒知道分工。①② 通道成功均发；全拒（未开工）不发。
+- **L2 运行期提醒**：lifecycle poll 遇 RUNNING/PENDING/STARTING/CANCEL_REQUESTED
+  不再静默，每轮尾部一行 `（子专家 <slug> 处理中: "<任务>"; 勿重复…）`（同 entry
+  字节稳定；UNKNOWN 重试轮保持静默——结果去向由 lost 交接卡一次性交代）。
+- **L3 终态交接卡**：recovered/failed/lost 全升级 `## 子专家交接` 语义，带
+  "主专家下一步" 指令（采纳/核验而非重做；失败/丢失 → 主进程自行处理或重派）。
+- **L4 审计键**：台账/提醒卡带 `delegation_id` → 跨重启可经 jsonl/filemem 重新
+  锚定"哪些活子专家接了"。
+- 折入裁决：F-2（lifecycle 3 元组兼容分支删除，生产不可达死代码；entry 升级为
+  6 元组尾部 + task_label）+ F-4（lost 诊断字段测试断言收紧为 `"unavailable"` 精确值）。
+- lifecycle entry 形态：`(subagent_id, handle_dict, dispatched_at,
+  frozen_contextvars, unknown_count, task_label)`（`_lifecycle_entry()` 归一 6 元组，
+  旧 5 元组尾部补 None，3 元组分支已删）。
+
+测试：`tests/test_delegation_ledger.py`（10 用例：L1 双通道台账 + 全拒不发 /
+L2 提醒字节稳定 + skip-running 同轮 + UNKNOWN 静默 / L3 recovered·failed·lost
+交接卡 / F-4 诊断精确值）。全量 77 passed（基线 67 + 新增 10，零回归）。宿主零改动。

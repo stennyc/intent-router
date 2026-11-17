@@ -123,7 +123,7 @@ def test_off_followup_no_anchor_dispatch_still_works(env):
     env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
     r = _turn(env, "查一下这个 API 的 SQL 注入", first=False, history=[_user_msg("x")])
     assert len(env.ctx.dispatch_calls) == 1
-    assert r is None                                     # 无锚点 → 无补注
+    assert r is not None and "分工台账" in r["context"]      # v2.5 L1: 无锚点 → 无补注（意图不变）; 派发轮出台账卡
     assert _sessions(env)["s1"].anchor is None
 
 

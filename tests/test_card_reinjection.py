@@ -183,12 +183,15 @@ def test_missing_card_falls_back_to_full_text(env):
 
 def test_no_anchor_no_reinjection(env):
     env.ctx.llm.scripts = [
-        None,                                             # 首轮分类 null → 无锚点
         {"category": "engineering", "confidence": 0.9},
+        # 注意: 首轮 "随便聊聊"(4字<10) 被问候守卫拦下、不烧分类（脚本序列从
+        # 第二轮算起）→ 无锚点; 第二轮分类 engineering → 派发
     ]
     assert _turn(env, "随便聊聊", first=True) is None
     r = _turn(env, "查一下注入", first=False, history=[_user_msg("[压缩摘要]")])
-    assert r is None
+    # v2.5 L1: 无锚点 → 无补卡（测试意图不变, "card-reinject" 不得出现）; 派发轮出台账卡
+    assert r is not None and "分工台账" in r["context"]
+    assert "card-reinject" not in _events(env)
 
 
 def test_empty_history_followup_never_reinjects(env):

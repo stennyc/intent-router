@@ -174,4 +174,4 @@ def test_success_path_unchanged_no_refused_events(env):
     assert not [e for e in evs if e["event"] in ("dispatch-refused", "dispatch-fallback-injection")], evs
     d = [e for e in evs if e["event"] == "dispatch"]
     assert len(d) == 1 and d[0]["delegation_id"].startswith("deleg_")
-    assert r is None
+    assert r is not None and "分工台账" in r["context"]      # v2.5 L1: 成功派发轮台账卡（通道②）

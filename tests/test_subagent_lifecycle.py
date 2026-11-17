@@ -181,9 +181,9 @@ def test_lifecycle_channel_spawns_prefers_it_over_dispatch_tool(env):
     d = [e for e in _events(env) if e["event"] == "dispatch"][0]
     assert d["channel"] == "subagent_lifecycle" and d["delegation_id"] == sid
     assert env.mod._SESSIONS["s1"].lifecycle      # running 追踪在 lifecycle map
-    r = _turn(env, "继续", first=False)           # 无脚本 → 不分类, 不应注入
+    r = _turn(env, "继续", first=False)           # v2.5 L2: RUNNING 提醒行（尾部加法, 无脚本不分类）
     env.ctx.llm.scripts = []
-    assert r is None
+    assert r is not None and "处理中" in r["context"]
 
 
 def test_lifecycle_unavailable_falls_back_to_delegate_task(env):
@@ -203,7 +203,7 @@ def test_lifecycle_unavailable_falls_back_to_delegate_task(env):
     d = [e for e in evs if e["event"] == "dispatch" and e.get("channel") == "delegate_task"]
     assert d and d[0]["delegation_id"].startswith("deleg_")
     assert env.mod._SESSIONS["s1"].lifecycle == {}
-    assert r is None
+    assert r is not None and "分工台账" in r["context"]      # v2.5 L1: 通道② 成功也出台账卡
 
 
 def test_no_lifecycle_service_keeps_legacy_path(env):
@@ -231,7 +231,7 @@ def test_no_lifecycle_service_keeps_legacy_path(env):
     evs = _events(env)
     assert not [e for e in evs if e["event"] == "lifecycle-unavailable"], evs
     assert not [e for e in evs if e.get("event") == "dispatch" and e.get("channel") == "subagent_lifecycle"]
-    assert r is None
+    assert r is not None and "分工台账" in r["context"]      # v2.5 L1
     absent = [e for e in evs if e["event"] == "lifecycle-absent"]
     assert absent and "attr-missing" in absent[0].get("reason", ""), evs
 
@@ -296,7 +296,7 @@ def test_lifecycle_attr_is_service_instance_spawns_directly(env):
     assert d and d[0]["delegation_id"].startswith("sub-"), evs
     assert not [e for e in evs if e["event"] in ("lifecycle-absent", "lifecycle-unavailable")], evs
     assert not [e for e in evs if e["event"] == "dispatch-refused"], evs
-    assert r is None
+    assert r is not None and "分工台账" in r["context"]      # v2.5 L1
 
 
 def test_lifecycle_service_none_records_absent(env):
@@ -365,13 +365,15 @@ def test_lifecycle_unknown_handle_is_lost(env):
     assert env.mod._SESSIONS["s1"].lifecycle == {}
 
 
-def test_lifecycle_running_still_tracked_next_turn_no_action(env):
+def test_lifecycle_running_now_injects_reminder(env):
+    """v2.5 L2 行为变更（owner 拍板）: RUNNING 不再静默——每轮一行提醒,
+    主专家持续知道子专家在做什么（取代旧 spec test_..._next_turn_no_action）。"""
     svc = _FakeLifecycle()
     sid = _dispatched(env, svc)
     svc.status_script[sid] = "RUNNING"
     env.ctx.llm.scripts.append({"category": "engineering", "confidence": 0.9})
     r = _turn(env, "那单元测试怎么写", first=False)
-    assert r is None
+    assert r is not None and "处理中" in r["context"]
     assert env.mod._SESSIONS["s1"].lifecycle, "running 子进程保留到下一轮"
     assert not [e for e in _events(env) if e["event"].startswith("subagent-result-")]
 
@@ -445,9 +447,9 @@ def test_unknown_not_cleared_until_retry_cap(env):
     r3 = _turn(env, "继续", first=False)
     lost = [e for e in _events(env) if e["event"] == "subagent-result-lost"]
     assert lost and lost[0]["delegation_id"] == sid
-    # A: 诊断字段（测试环境宿主模块不可 import → unavailable；生产 gateway 内为真实 session/none）
-    assert "resolver_session" in lost[0] and "frozen_session" in lost[0], lost[0]
-    assert lost[0]["resolver_session"] in ("unavailable", "none", "no-session", "probe-error", ""), lost[0]
+    # A+F-4: 诊断字段收紧为精确值——测试环境宿主模块不可 import → 确定性 "unavailable"
+    assert lost[0]["resolver_session"] == "unavailable", lost[0]
+    assert lost[0]["frozen_session"] == "unavailable", lost[0]
     # C: 指针卡 append-only 注入（主进程至少接诚实交代）
     assert r3 and "context" in r3 and sid in r3["context"]
     # D: lost 清守卫后同轮立即重派新子专家接任务（owner 策略 B），旧 entry 被新 sid 取代

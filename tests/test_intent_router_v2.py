@@ -5,8 +5,10 @@ Owner rulings encoded here (2026-11-16):
   (no per-session cap); no re-dispatch while one is running.
 - Cross-platform: zero hardcoded path constants; expert paths are pathlib-resolved
   at runtime; tests use only pathlib/tmp_path (no C:\\ or /root fixtures).
-- Cache safety: injection happens on turn 1 only; every later turn's model prefix
-  is a pure byte-extension of the previous one (regression test below).
+- Cache safety: turn 1 injects the anchor expert; v2.5 (2026-11-17 owner ruling)
+  adds the delegation-ledger card on successful dispatch rounds + running
+  reminder line — all pure tail appends; every turn's model prefix remains a
+  byte-extension of the previous one (regression test below).
 
 Run: python -m pytest tests/ -v   (scratch venv, pytest + stdlib only, no network)
 """
@@ -179,7 +181,7 @@ def test_new_domain_dispatches_sub_expert_with_self_serve_context(env):
     r = _turn(env, "查一下这个 API 的 SQL 注入", first=False,
                history=[{"role": "user", "content": turn1_persisted},
                         {"role": "assistant", "content": "done"}])
-    assert r is None                        # 标记可见 → 零补注；新域 → 只派发
+    assert r is not None and "分工台账" in r["context"]      # v2.5 L1: 标记可见 → 零补注；派发轮只出台账卡
     assert len(env.ctx.dispatch_calls) == 1
     tool, args, kw = env.ctx.dispatch_calls[0]
     assert tool == "delegate_task"
@@ -298,7 +300,7 @@ def test_prefix_cache_stable_across_turns(env):
         prev_stream = stream
         stored.append({"role": "user", "content": eff_user})
         stored.append({"role": "assistant", "content": f"reply-{i}"})
-    assert injection_turns == [0]           # ONLY turn 1 injects
+    assert injection_turns == [0, 2, 4]          # v2.5: turn 1 锚点 + 派发轮台账卡（turn 2/4）；全部纯尾部加法，上方 startswith 字节扩展检查不变
 
 
 # ── structured audit log ─────────────────────────────────────────────────────
@@ -336,7 +338,8 @@ def test_log_failure_is_fail_soft(env, tmp_path):
     env.mod._LOG_PATH = blocker / "dispatches.jsonl"
     r = _turn(env, "帮我写个 REST 后端 API", first=True)
     assert r is not None and "context" in r      # anchor injection still works
-    assert _turn(env, "查一下注入", first=False) is None  # dispatch path still works
+    r2 = _turn(env, "查一下注入", first=False)
+    assert r2 is not None and "分工台账" in r2["context"]  # v2.5 L1: 派发路径仍工作 + 台账卡（日志故障 fail-soft 不变）
     assert len(env.ctx.dispatch_calls) == 1      # the dispatch itself succeeded
 
 

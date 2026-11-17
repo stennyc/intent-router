@@ -19,6 +19,16 @@ owner 裁决（2026-11-16，记录于代码）:
   专家 persona 时（域 profile），配置 plugins.entries.intent-router.settings
   .anchor_inject=false → 首轮跳过分类+注入（免重复+免稀释），/expert 手动切换
   不受影响；缺省/异常 = true（fail-soft，行为同 v2.2）。
+- 分工台账（v2.5, owner 裁决 2026-11-17 "动手"）: 治"主/子专家各做各的"
+  结构性缺口——派发发生在主 LLM 处理消息之前, 主专家零感知子专家在做什么。
+  全部 append-only 尾部加法（缓存不变量不变）:
+  L1 派发成功同轮注入台账卡（slug+任务+delegation_id 审计键, "勿重复"）;
+  L2 lifecycle RUNNING 每轮一行提醒（字节稳定; UNKNOWN 重试轮静默——
+     结果去向由 lost 交接卡一次性交代）; L3 终态全升级"## 子专家交接"
+     语义（recovered/failed/lost 均带"主专家下一步"指令）; L4 台账/提醒带
+     delegation 审计键 → 跨重启可经 jsonl/filemem 重新锚定。
+  折入: F-2（lifecycle 3 元组兼容分支删除, 生产不可达死代码）+
+  F-4（lost 诊断字段测试断言收紧为 "unavailable" 精确值）。
 
 设计:
 - Turn 1（v1 现况不变）: 分类 → 锚点专家 X，X 全文注入一次。
@@ -178,7 +188,9 @@ class _SessionState:
         self.full_on_next: bool = False
         # v2.4: slug -> lifecycle entry（宿主 subagent-lifecycle 通道派发的子专家；
         # 结果经轮询恢复）。v2.4.3 5 元组: (subagent_id, handle_dict, dispatched_at,
-        # frozen_contextvars, unknown_count)；_lifecycle_entry() 兼容旧 3 元组。
+        # frozen_contextvars, unknown_count)。v2.5 6 元组: 尾部 + task_label
+        # （L1 台账 / L2 提醒的任务标签, 同 running 窗口内字节稳定）；
+        # _lifecycle_entry() 归一 6 元组（F-2: 旧 3 元组兼容分支已删, 生产不可达）。
         self.lifecycle: Dict[str, tuple] = {}
 
 
@@ -256,17 +268,18 @@ def _sweep_running(st: _SessionState) -> None:
     now = time.time()
     for slug in [s for s, (_d, ts) in st.running.items() if now - ts > _RUNNING_TTL]:
         del st.running[slug]
-    for slug in [s for s, e in st.lifecycle.items() if now - _lifecycle_entry(e)[2] > _RUNNING_TTL]:
+    for slug in [s for s, e in st.lifecycle.items() if now - (_lifecycle_entry(e)[2] or 0.0) > _RUNNING_TTL]:
         del st.lifecycle[slug]
 
 
 def _lifecycle_entry(entry):
-    """lifecycle entry 解包（v2.4.3 5 元组 → 兼容旧 3 元组）。
-    5 元组: (subagent_id, handle_dict, dispatched_at, frozen_context, unknown_count)。"""
-    if len(entry) == 3:
-        sid, hdict, ts = entry
-        return (sid, hdict, ts, None, 0)
-    return entry
+    """lifecycle entry 解包 → 归一 6 元组 (sid, hdict, ts, frozen, unknown_count, task_label)。
+    生产写侧恒 6 元组；进程内旧 5 元组尾部补 None（task_label 侧用 `or ""` 兜底）。
+    F-2（owner 裁决 2026-11-17）: 旧 3 元组兼容分支删除——生产不可达的防御死代码。"""
+    e = tuple(entry)
+    if len(e) < 6:
+        e = e + (None,) * (6 - len(e))
+    return e
 
 
 # ── 结构化审计日志（fail-soft：日志故障绝不影响 hook） ────────────────────
@@ -346,9 +359,58 @@ def _recent_history(conversation_history: Any, n: int = 2, cap: int = 500) -> st
 
 
 def _join_ctx(*pieces: Optional[str]) -> Optional[str]:
-    """合并注入片（append-only，保持字节序稳定：reinject 在前、lifecycle findings 次之、fallback 最后）。"""
+    """合并注入片（append-only，保持字节序稳定：reinject 在前、lifecycle findings 次之、
+    派发轮上下文（v2.5 台账卡 / 降级注入）最后）。"""
     out = "\n\n".join(p for p in pieces if p)
     return out or None
+
+
+# ── 分工台账（v2.5, owner 裁决 2026-11-17）: 主专家全程知道子专家在做什么 ────
+
+def _task_label(user_message: str, cap: int = 80) -> str:
+    """L1/L2 卡片用的单行任务标签（同 running 窗口内字节稳定 → 缓存友好）。"""
+    return " ".join(str(user_message or "").split())[:cap]
+
+
+def _ledger_card(slug: str, task_label: str, deleg_id: str, channel: str) -> str:
+    """L1+L4: 派发成功同轮台账卡——主专家从开工第一秒知道分工（append-only）。"""
+    return (
+        f"## 分工台账（进行中）\n"
+        f"子专家 {slug} 已接手: “{task_label}”（delegation_id={deleg_id}, channel={channel}）\n"
+        f"- 此项由子专家处理中: 主进程勿重复该项工作\n"
+        f"- 完成后 findings 自动送达（下一轮自动追加 / 完成消息重入）"
+    )
+
+
+def _running_reminder(slug: str, task_label: str, sid: str) -> str:
+    """L2+L4: RUNNING 期间每轮尾部一行提醒（同 entry 字节稳定；UNKNOWN 轮静默——
+    结果去向由 lost 交接卡一次性交代）。"""
+    return (f"（子专家 {slug} 处理中: “{task_label}”; 主进程勿重复该项"
+            f"（delegation_id={sid}）, 完成后 findings 自动送达）")
+
+
+def _failed_handoff(slug: str, task_label: str, sid: str, state: str, err: str) -> str:
+    """L3: 失败终态交接卡——主专家知道"子专家没干成"，自行处理或重派。"""
+    return (
+        f"## 子专家交接 ({slug}) — {state}\n"
+        f"子专家 {slug} 未正常完成 “{task_label}”（{state}: {err}）。\n"
+        f"主专家下一步: 主进程自行处理该项, 或发新任务触发自动重派（审计键 delegation_id={sid}）。"
+    )
+
+
+def _lost_pointer(slug: str, sid: str) -> str:
+    """v2.4.3: UNKNOWN 重试耗尽的诚实指针卡——主进程至少"接"到交代（append-only）。
+    v2.4.4 F4: 加 filemem 持久副本检索指引 + 采纳不重做（F2 指示子专家落盘后跨重启可捞回）。
+    v2.5 L3: 升级"交接"语义 + 主专家下一步指令。"""
+    return (
+        f"## 子专家交接 ({slug}) — 结果丢失\n"
+        f"Host subagent {sid}: result registry entry unavailable after "
+        f"{_UNKNOWN_RETRY_CAP} polls (gateway restart cleared the in-process host registry, "
+        f"or the host lifecycle context gate rejected the poll). Findings are NOT recoverable "
+        f"via the lifecycle API; the sub-expert ran in its own host subagent session.\n"
+        f"主专家下一步: 若其成果已落盘, filemem 检索 slug={slug} + 时间窗（审计键 delegation_id={sid}, "
+        f"宿主 agent.log/supercompress 亦可查）——找到请采纳/核验而非重做; 未找到请主进程自行处理该项。"
+    )
 
 
 def _get_lifecycle_service(ctx: Any) -> Tuple[Any, Optional[str]]:
@@ -389,13 +451,14 @@ def _handle_to_dict(handle: Any) -> Optional[dict]:
 
 def _lifecycle_dispatch(ctx: Any, st: _SessionState, session_id: str,
                        goal: str, context_text: str, category: str, slug: str,
-                       confidence: float, expert_path: Path) -> Optional[str]:
+                       confidence: float, expert_path: Path, task_label: str = "") -> Optional[str]:
     """通道①: ctx.subagent_lifecycle().launch(...)。宿主 turn facade 每轮把父 agent
     bind 进 contextvar（gateway 模式 _cli_ref=None 时 dispatch_tool 拿不到 parent, 此通道可用）。
     launch 接受 Mapping（宿主 _coerce_request）；返回 SubagentHandle(subagent_id, to_dict)。
     结果不产生 [ASYNC DELEGATION] 重入（宿主重入通知只在 delegate_task 派发层注册）
     → 轮询 _poll_lifecycle 是结果交付的唯一通道。成功返回 subagent_id, 不可用返回 None
-    （不可用原因记 lifecycle-absent；launch 被拒记 lifecycle-unavailable）。"""
+    （不可用原因记 lifecycle-absent；launch 被拒记 lifecycle-unavailable）。
+    v2.5: task_label 入 6 元组（L1 台账 / L2 提醒的任务标签）。"""
     svc, absent_reason = _get_lifecycle_service(ctx)
     if svc is None:
         _log(session_id, "lifecycle-absent", expert=slug, reason=absent_reason or "unknown")
@@ -414,7 +477,7 @@ def _lifecycle_dispatch(ctx: Any, st: _SessionState, session_id: str,
         return None
     with _LOCK:
         _sweep_running(st)
-        st.lifecycle[slug] = (sid, _handle_to_dict(handle), time.time(), frozen, 0)
+        st.lifecycle[slug] = (sid, _handle_to_dict(handle), time.time(), frozen, 0, task_label)
         # v2.4.3 (D): lifecycle 通道也占 running 守卫 —— 否则同域后续轮每轮重派,
         # st.lifecycle[slug] 被新 sid 覆盖 → 旧子专家 handle 成孤儿（结果永不回收）
         st.running[slug] = (sid, time.time())
@@ -428,7 +491,9 @@ def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[st
     非终态保留; UNKNOWN（宿主 gate 不匹配/注册表失踪）不再一次清账: 连续
     _UNKNOWN_RETRY_CAP 次才判 lost（_RUNNING_TTL sweep 兜底），期间注册表恢复即
     recovered。宿主 gate3 依赖 contextvar → status/result 在 launch 时刻冻结的
-    contextvars 快照里 replay（_lifecycle_dispatch 存的第 4 元）。"""
+    contextvars 快照里 replay（_lifecycle_dispatch 存的第 4 元）。
+    v2.5: L2 RUNNING 每轮一行提醒（不再静默, 主专家持续知道分工）; L3 终态全升级
+    "## 子专家交接" 语义（recovered/failed/lost 均带主专家下一步指令）。"""
     if not st.lifecycle:
         return None
     svc, _absent = _get_lifecycle_service(ctx)
@@ -439,7 +504,10 @@ def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[st
         _sweep_running(st)
         pending = list(st.lifecycle.items())
     for slug, raw_entry in pending:
-        sid, hdict, ts, frozen, unk = _lifecycle_entry(raw_entry)
+        sid, hdict, ts, frozen, unk, task_label = _lifecycle_entry(raw_entry)
+        sid = str(sid or "")
+        task_label = str(task_label or "")
+        unk = int(unk or 0)
         if hdict is None:
             continue
 
@@ -453,6 +521,8 @@ def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[st
             status = None
         state = str(getattr(status, "state", "UNKNOWN") or "UNKNOWN")
         if state in ("RUNNING", "PENDING", "STARTING", "CANCEL_REQUESTED"):
+            # v2.5 L2: 运行期提醒（同 entry 字节稳定; UNKNOWN 轮不在此分支 → 保持静默）
+            pieces.append(_running_reminder(slug, task_label, sid))
             continue
         terminal = state in ("SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED")
         result: Any = None
@@ -472,11 +542,14 @@ def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[st
                 summary = str(getattr(result, "summary", None) or "").strip()
                 if summary:
                     _log(session_id, "subagent-result-recovered", expert=slug, delegation_id=sid)
-                    # v2.4.4 F4 接入指引: 主专家拿到成果时知道怎么用——采纳/核验, 不重做
+                    # v2.4.4 F4 接入指引 + v2.5 L3 "交接" 语义: 主专家拿到成果知道怎么用——
+                    # 采纳/核验, 不重做
                     pieces.append(
-                        f"## Sub-expert findings ({slug})\n{summary}\n"
-                        f"（由子专家 {slug} 独立完成; 请采纳/核验而非重做。"
-                        f"持久副本（若已落盘）: filemem 检索 slug={slug} + 时间窗; 审计键 delegation_id={sid}）"
+                        f"## 子专家交接 ({slug}) — 完成\n"
+                        f"子专家 {slug} 已完成 “{task_label}”, findings:\n"
+                        f"{summary}\n"
+                        f"主专家下一步: 采纳/核验（而非重做）; 需深入时并入当前工作。\n"
+                        f"持久副本（若已落盘）: filemem 检索 slug={slug} + 时间窗; 审计键 delegation_id={sid}"
                     )
                 else:
                     _log(session_id, "subagent-result-recovered", expert=slug,
@@ -486,12 +559,14 @@ def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[st
                           or getattr(result, "error_classification", None) or state)
                 _log(session_id, "subagent-result-failed", expert=slug, delegation_id=sid,
                      state=state, error=err[:300])
+                # v2.5 L3: 失败也是交接——主专家知道子专家没干成, 自行处理或重派
+                pieces.append(_failed_handoff(slug, task_label, sid, state, err[:300]))
             continue
         # UNKNOWN: 宿主 gate 不匹配或注册表已清 → 重试窗口（不动 running 守卫——守卫属于原 sid）
         unk += 1
         if unk < _UNKNOWN_RETRY_CAP:
             with _LOCK:
-                st.lifecycle[slug] = (sid, hdict, ts, frozen, unk)
+                st.lifecycle[slug] = (sid, hdict, ts, frozen, unk, task_label)
             continue
         with _LOCK:
             st.lifecycle.pop(slug, None)
@@ -530,20 +605,6 @@ def _probe_resolver(frozen: Any) -> Dict[str, str]:
     return {"resolver_session": cur, "frozen_session": frz}
 
 
-def _lost_pointer(slug: str, sid: str) -> str:
-    """v2.4.3: UNKNOWN 重试耗尽的诚实指针卡——主进程至少"接"到交代（append-only）。
-    v2.4.4 F4: 加 filemem 持久副本检索指引 + 采纳不重做（F2 指示子专家落盘后跨重启可捞回）。"""
-    return (
-        f"## Sub-expert status ({slug})\n"
-        f"Host subagent {sid}: result registry entry unavailable after "
-        f"{_UNKNOWN_RETRY_CAP} polls (gateway restart cleared the in-process host registry, "
-        f"or the host lifecycle context gate rejected the poll). Findings are NOT recoverable "
-        f"via the lifecycle API; the sub-expert ran in its own host subagent session. "
-        f"若其成果已落盘: filemem 检索 slug={slug} + 时间窗（审计键 delegation_id={sid}, "
-        f"宿主 agent.log/supercompress 亦可查）——找到请采纳/核验而非重做。"
-    )
-
-
 def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_message: str,
                          conversation_history: Any, category: str, slug: str,
                          confidence: float) -> Tuple[Optional[str], Optional[str]]:
@@ -553,10 +614,12 @@ def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_mess
     ② 本函数主体 — ctx.dispatch_tool("delegate_task")（CLI 模式; gateway 模式返回
        tool_error JSON → 记 "dispatch-refused" 而非假 "dispatch", 不污染 running）。
     ③ 全拒且专家正文可得 → 降级 in-session 注入（"dispatch-fallback-injection"）。
-    返回 (delegation_id, fallback_context): 成功 → (id, None)；全拒且有正文 → (None, 注入文本)。
+    返回 (delegation_id, dispatch_turn_context): 成功 → (id, v2.5 L1 台账卡, 主专家
+    开工第一秒知道分工); 全拒且有正文 → (None, 注入文本)。
     不传 toolsets → 子代理继承父工具面，含 filemem + knowledge-base-search
     （已核实 DELEGATE_BLOCKED_TOOLS 不覆盖这两组）。"""
     expert_path = _EXPERTS_DIR / f"{slug}.md"
+    task_label = _task_label(user_message)      # v2.5: 台账/提醒卡的任务标签（单行截断）
     goal = f"作为 {category} 领域专家（{slug}）执行以下任务，只交付 findings/结果。"
     context_text = "\n".join([
         f"1. 先读专家文件（file 工具）: {expert_path}",
@@ -577,9 +640,10 @@ def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_mess
     ])
     # ① subagent-lifecycle 通道（gateway 模式）: 成功即真子 agent 已起, 返回关联 id
     sid = _lifecycle_dispatch(ctx, st, session_id, goal, context_text,
-                             category, slug, confidence, expert_path)
+                             category, slug, confidence, expert_path, task_label)
     if sid is not None:
-        return sid, None
+        # v2.5 L1+L4: 成功同轮台账卡——主专家从开工第一秒知道分工（勿重复 + 审计键）
+        return sid, _ledger_card(slug, task_label, sid, "subagent_lifecycle")
     # ② 旧通道 delegate_task
     args = {"tasks": [{"goal": goal, "context": context_text}]}
     try:
@@ -607,7 +671,8 @@ def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_mess
             st.running[slug] = (deleg_id, time.time())
         _log(session_id, "dispatch", category=category, expert=slug, confidence=confidence,
              delegation_id=deleg_id, channel="delegate_task", expert_path=str(expert_path))
-        return deleg_id, None
+        # v2.5 L1+L4: 通道② 成功同轮台账卡（结果经 [ASYNC DELEGATION] 重入送达）
+        return deleg_id, _ledger_card(slug, task_label, deleg_id, "delegate_task")
     # 拒绝（tool_error JSON / 不可解析）→ 拒绝事实入审计；running 不动，避免假 running 卡住重派
     if error_text is None:
         error_text = f"unparseable result: {str(raw)[:200]}"
@@ -862,10 +927,12 @@ def _make_hook(ctx: Any):
                 _log(session_id, "skip-running", category=category, expert=slug)
                 ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx)
                 return {"context": ctx_out} if ctx_out else None
-        _deleg_id, fallback_ctx = _dispatch_sub_expert(ctx, st, session_id, msg,
+        _deleg_id, dispatch_ctx = _dispatch_sub_expert(ctx, st, session_id, msg,
                                                         conversation_history,
                                                         category, slug, confidence)
-        ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx, fallback_ctx)
+        # v2.5 L1: dispatch_ctx = 成功轮台账卡 / 全拒降级注入（_join_ctx 保持字节序:
+        # reinject → lifecycle findings/提醒/交接 → 派发轮上下文）
+        ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx, dispatch_ctx)
         return {"context": ctx_out} if ctx_out else None
 
     return _intent_router_hook
@@ -886,5 +953,5 @@ def _manifest_version() -> str:
 def register(ctx) -> None:
     """插件注册入口（宿主加载时调用一次）"""
     ctx.register_hook("pre_llm_call", _make_hook(ctx))
-    logger.info("intent-router v%s registered (anchor + sub-expert dispatch via subagent-lifecycle + card reinjection + /expert + anchor_inject + refused-observability + lifecycle-absent diagnostics)",
+    logger.info("intent-router v%s registered (anchor + sub-expert dispatch via subagent-lifecycle + delegation-ledger + card reinjection + /expert + anchor_inject + refused-observability + lifecycle-absent diagnostics)",
                 _manifest_version())
