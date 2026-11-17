@@ -328,11 +328,25 @@ def _recent_history(conversation_history: Any, n: int = 2, cap: int = 500) -> st
         return ""
 
 
+def _join_ctx(*pieces: Optional[str]) -> Optional[str]:
+    """合并注入片（append-only，保持字节序稳定：reinject 在前、fallback 在后）。"""
+    out = "\n\n".join(p for p in pieces if p)
+    return out or None
+
+
 def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_message: str,
                          conversation_history: Any, category: str, slug: str,
-                         confidence: float) -> Optional[str]:
-    """派发 Y 域子专家。background 语义：立即返回，结果以新消息重入（append-only，
-    缓存安全）。不传 toolsets → 子代理继承父工具面，含 filemem + knowledge-base-search
+                         confidence: float) -> Tuple[Optional[str], Optional[str]]:
+    """派发 Y 域子专家。v2.4 通道与降级（owner 裁决 2026-11-17: 宿主只读，改动仅落插件层）:
+    - 通道② (本函数当前主体): ctx.dispatch_tool("delegate_task") — 宿主在 gateway 模式下
+      无法附 parent agent，delegate_task 返回 tool_error JSON（'{"error": ...}'）。
+      旧行为把拒绝误记为 "dispatch"（delegation_id=null 假派发，2026-11-17 实证 23 条）。
+      现在: 拒绝记 "dispatch-refused"（不污染 running、不发假 dispatch）；
+      双通道全拒且专家正文可得 → 降级 in-session 注入（programming value 不丢）
+      → "dispatch-fallback-injection"。
+    - 通道① ctx.subagent_lifecycle().launch(...) 与结果轮询见 _poll_lifecycle/_lifecycle_dispatch。
+    返回 (delegation_id, fallback_context): 成功 → (id, None)；拒绝且有正文 → (None, 注入文本)。
+    不传 toolsets → 子代理继承父工具面，含 filemem + knowledge-base-search
     （已核实 DELEGATE_BLOCKED_TOOLS 不覆盖这两组）。"""
     expert_path = _EXPERTS_DIR / f"{slug}.md"
     goal = f"作为 {category} 领域专家（{slug}）执行以下任务，只交付 findings/结果。"
@@ -349,22 +363,38 @@ def _dispatch_sub_expert(ctx: Any, st: _SessionState, session_id: str, user_mess
     try:
         raw = ctx.dispatch_tool("delegate_task", args)
     except Exception as e:
+        # 宿主工具面本身故障（区别于"返回拒绝"）: 保留 dispatch-error 语义, 不做降级注入
         logger.error(f"intent-router: sub-expert dispatch failed: {e}")
         _log(session_id, "dispatch-error", expert=slug, error=str(e))
-        return None
-    deleg_id: Optional[str] = None
+        return None, None
+    parsed: Any = None
     try:
         parsed = json.loads(raw) if isinstance(raw, str) else raw
-        if isinstance(parsed, dict):
-            deleg_id = str(parsed.get("delegation_id") or "")
     except Exception:
-        pass
-    with _LOCK:
-        _sweep_running(st)
-        st.running[slug] = (deleg_id or "", time.time())
-    _log(session_id, "dispatch", category=category, expert=slug, confidence=confidence,
-         delegation_id=deleg_id or None, expert_path=str(expert_path))
-    return deleg_id
+        parsed = None
+    deleg_id: Optional[str] = None
+    error_text: Optional[str] = None
+    if isinstance(parsed, dict):
+        if parsed.get("delegation_id"):
+            deleg_id = str(parsed["delegation_id"])
+        elif "error" in parsed:
+            error_text = str(parsed.get("error"))
+    if deleg_id is not None:
+        with _LOCK:
+            _sweep_running(st)
+            st.running[slug] = (deleg_id, time.time())
+        _log(session_id, "dispatch", category=category, expert=slug, confidence=confidence,
+             delegation_id=deleg_id, channel="delegate_task", expert_path=str(expert_path))
+        return deleg_id, None
+    # 拒绝（tool_error JSON / 不可解析）→ 拒绝事实入审计；running 不动，避免假 running 卡住重派
+    if error_text is None:
+        error_text = f"unparseable result: {str(raw)[:200]}"
+    _log(session_id, "dispatch-refused", expert=slug, channel="delegate_task", error=error_text[:300])
+    body = _load_expert_context(slug)
+    if body:
+        _log(session_id, "dispatch-fallback-injection", expert=slug, confidence=confidence)
+        return None, _wrap_injection(category, slug, body)
+    return None, None
 
 
 # ── 完成消息重入处理（循环守卫） ────────────────────────────────────────────
@@ -606,9 +636,11 @@ def _make_hook(ctx: Any):
             if slug in st.running:
                 _log(session_id, "skip-running", category=category, expert=slug)
                 return {"context": reinject_ctx} if reinject_ctx else None
-        _dispatch_sub_expert(ctx, st, session_id, msg, conversation_history,
-                             category, slug, confidence)
-        return {"context": reinject_ctx} if reinject_ctx else None
+        _deleg_id, fallback_ctx = _dispatch_sub_expert(ctx, st, session_id, msg,
+                                                        conversation_history,
+                                                        category, slug, confidence)
+        ctx_out = _join_ctx(reinject_ctx, fallback_ctx)
+        return {"context": ctx_out} if ctx_out else None
 
     return _intent_router_hook
 
