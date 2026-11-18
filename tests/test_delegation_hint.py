@@ -128,6 +128,30 @@ def test_new_domain_injects_hint_card(env):
     assert len(hints) == 1 and hints[0]["expert"] == "engineering-security-engineer"
 
 
+def test_hint_card_binding_not_advisory(env):
+    """v3.3 绑定口吻: 卡指令'原样采用' goal/context 字段, 且旧的弱化建议语（'仅为可选建议'）移除。
+    实证（2026-11-18 8497e1）: 模型自写 goal 丢了专家形态——卡片建议口吻塑形失败的直接后果。"""
+    r, _h = _anchor_and_new_domain(env)
+    ctx_text = r["context"]
+    assert "原样" in ctx_text, "绑定语: 指示模型原样使用模板"
+    assert "可选建议" not in ctx_text, "弱化建议口吻必须移除"
+
+
+def test_hint_card_single_task_discipline(env):
+    """v3.3 调度纪律: 一次委派一个任务, 勿创建占位/备用子 agent。
+    实证（2026-11-18 7ad9c4）: 模型同调用塞'备用占位'任务, 3 秒后自停——卡面无纪律约束。"""
+    r, _h = _anchor_and_new_domain(env)
+    ctx_text = r["context"]
+    assert "一次只委派一个任务" in ctx_text
+    assert "占位" in ctx_text
+
+
+def test_hint_card_goal_no_repeat_boundary(env):
+    """v3.3 F3 边界: goal 明写'勿重做主进程已在做的工作'（治'各做各的', 主→子方向缺口）。"""
+    r, _h = _anchor_and_new_domain(env)
+    assert "勿重做主进程" in r["context"]
+
+
 def test_hint_idempotent_per_domain(env):
     """同域后续轮不再出卡（每 session 每域一次）——hint 轮必须持久化进历史
     （宿主语义: 该轮 user message = 原话 + 注入, 标记随其留存 → 标记可见不再补）。"""

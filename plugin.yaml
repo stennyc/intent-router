@@ -1,6 +1,6 @@
 name: intent-router
-version: "3.2.0"
-description: "动态专家上下文路由 v3.2.0 — 锚点专家固定注入 + 委派提示卡（模型驱动委派, owner 裁决 2026-11-18: 新域过 gate 时 append-only 提示卡, 模型自己调宿主 delegate_task 拉子专家, 结果宿主自动重入, 插件零 spawn）+ 压缩后蒸馏卡补注 + 完成重入轮 completion-skip + /expert 手动覆盖 + anchor_inject 配置开关 + P0 子 session 平台守卫 + G1 短消息护栏（v3.2 起唯一静默门, 问句 regex 已退役——全球化裁决: 问句与普通消息同律过 aux + conf gate）"
+version: "3.3.0"
+description: "动态专家上下文路由 v3.3.0 — 锚点专家固定注入 + 委派提示卡（模型驱动委派, owner 裁决 2026-11-18: 新域过 gate 时 append-only 提示卡, 模型自己调宿主 delegate_task 拉子专家, 结果宿主自动重入, 插件零 spawn）+ 压缩后蒸馏卡补注 + 完成重入轮 completion-skip + /expert 手动覆盖 + anchor_inject 配置开关 + P0 子 session 平台守卫 + G1 短消息护栏（唯一静默门, 语言无关）+ 绑定式委派提示卡（v3.3: 原样采用 goal/context 模板 + 单任务调度纪律 + F3 不重做边界——治「委派了但模板没被采用」, owner 裁决 2026-11-18）"
 author: hermes-agent
 license: MIT
 config_schema:

@@ -431,3 +431,28 @@ owner 裁 **A 案**：regex 整体删除，**不加替代提示词指令**（C �
 
 **活体效果**：下次 gateway 重启注册行 `intent-router v3.2.0 registered (… + subagent-guard)`；
 英文/中文问句不再有任何差异化静默行为，行为完全由 aux 判断 + conf gate 呈现。
+
+## v3.3（2026-11-18，绑定式委派提示卡 —— owner 裁决「动手」）
+
+**裁决依据（活体实证 ×2, session local-4e22f0ba 的 env-brief 第 3 轮审查）**：
+- `8497e1`：模型在 code-review 0.95 提示卡后自主 delegate_task（**v3 模型驱动委派活体首单**），
+  但 goal 是**自写任务体**（无"作为 X 领域专家（slug）"framing）→ 子 agent 全程**从未读专家文件**
+  （`experts/` grep = 0）——提示卡的"可选建议"口吻塑形失败：委派发生了，专家形态没跟上。
+- `7ad9c4`：模型同调用塞了个"备用占位"任务（goal 自述"不需要"），3 秒后自 stop（宿主硬中断,
+  `interrupted_during_api_call`, 设计内 interrupted 终态）——卡面无调度纪律约束。
+
+**实现（纯插件, 宿主零改动）**：`_hint_card` 重写为绑定式：
+
+- 口吻升级：「请调用…仅为可选建议」→「请**原样采用** tasks[0] 两个字段（勿改写 goal、勿删减 context）」
+- goal 明写 F3 边界：「只交付 findings/结果, 勿重做主进程已在做的工作」（治"各做各的"主→子缺口）
+- 新增调度纪律行：「一次只委派一个任务——勿创建占位/备用/no-op 子 agent」（治 7ad9c4 型噪声）
+- 保留面不变：slug/conf/expert 路径/filemem+kbs 自取/git 归主进程/压缩重出标记
+
+测试：`test_delegation_hint.py` +3 用例（绑定口吻 / 单任务纪律 / F3 边界）RED→GREEN;
+全量 **66 passed**, `py_compile` 干净, manifest **3.3.0**。
+
+**边界（架构诚实）**：v3 形态下模型仍可能自写 goal——绑定只能提高塑形率, 不能强制;
+"100% 专家形态" = v2 确定性派发（owner 已退役）。活体观察点：下次新域委派, 看子 agent
+goal 是否逐字采用卡面模板 + 是否读了专家文件（`agent.log` 子 session grep `experts/`）。
+
+活体验收信号：下次 gateway 重启注册行 `intent-router v3.3.0 registered (…)`.

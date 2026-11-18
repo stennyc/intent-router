@@ -342,21 +342,26 @@ def _hint_visible(st: _SessionState, conversation_history: Any) -> bool:
 
 
 def _hint_card(slug: str, category: str, confidence: float, user_message: str) -> str:
-    """v3 委派提示卡——模型驱动委派：告知新域 + delegate_task 调用模板。
-    模型自行决定是否委派（宿主 delegate_task 自带 [ASYNC DELEGATION] 合成重入,
-    回传免费）; 不委派亦可自答。append-only 尾部加法, 缓存安全。"""
+    """v3.3 绑定式委派提示卡（owner 裁决 2026-11-18: 治「委派了但模板没被采用」——
+    活体实证 8497e1: 模型自写 goal 丢了专家形态, 子专家从未读专家文件）:
+    - 口吻从「可选建议」升为**绑定**: 原样采用 goal/context 两字段, 勿改写/勿删减
+    - 调度纪律: 一次只委派一个任务, 勿创建占位/备用子 agent（实证 7ad9c4）
+    - goal 明写 F3 边界: 勿重做主进程已在做的工作（治「各做各的」）
+    append-only 尾部加法, 缓存安全。"""
     expert_path = _EXPERTS_DIR / f"{slug}.md"
     task = _task_label(user_message)
     return (
         f"## 委派提示（新域: {category}）\n"
-        f"检测到新领域 {category}（专家 slug={slug}, conf={confidence}）。\n"
-        f"如值得委派给子专家, 请调用 delegate_task:\n"
-        f"- goal: 作为 {category} 领域专家（{slug}）执行以下任务: {task}; 只交付 findings/结果\n"
+        f"检测到新领域 {category}（专家 slug={slug}, conf={confidence}）。"
+        f"如委派, 请**原样采用**下面 delegate_task 的 tasks[0] 两个字段（勿改写 goal、勿删减 context）:\n"
+        f"- goal: 作为 {category} 领域专家（{slug}）执行以下任务: {task}。"
+        f"只交付 findings/结果, 勿重做主进程已在做的工作。\n"
         f"- context: 1) 先读专家文件 {expert_path}（file 工具; 若文件不存在则在结果中说明, "
         f"勿从网络拉取）; 2) 动手前自取持久上下文: 用 filemem_search 与 kb_search_central "
         f"查与本任务相关的 {category} 域事实; 3) 只交付 findings, 不做 git commit/push"
         f"（git 归主进程）。\n"
-        f"结果由宿主自动重入（无需轮询）。不委派也可自行作答——本提示仅为可选建议。\n"
+        f"纪律: 一次只委派一个任务——勿创建占位/备用/no-op 子 agent。"
+        f"结果由宿主自动重入（无需轮询）; 不委派则主进程直接自答亦可。\n"
         f"{_HINT_MARKER_FMT.format(slug)}"
     )
 
