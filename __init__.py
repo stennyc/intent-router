@@ -42,6 +42,15 @@ owner 裁决（2026-11-16，记录于代码）:
   审计键主匹配 + slug 兜底, fail-soft）, 命中并入卡（「### 持久层自动捞回」append-only 段;
   lost 卡为终态一次性注入 → 缓存不变量不受影响）; 未命中 base 卡字节稳定（测试钉住）。
   lost 事件带 filemem_hits/filemem_hit_ids 观测字段。宿主零改动。
+- 问句前置门（v2.9-c, owner 裁决 2026-11-18 "A+C" 之 A）: 后续轮状态/元问句
+  （句尾 ？/?/吗/呢/嘛 或 句首疑问词 为什么/为何/为啥/是不是/有没有/是否/能否/
+  可否/接下来/下一步）静默跳过 aux 分类——答问题的价值在主进程整合, 子专家盲
+  并行会话 = 误路由噪声（11-18 活体三点实证: "完成了吗"→writing 0.95 误派、
+  "推，然后继续"→eng 0.85 误派、"已重启…接下来呢？"再派）。确定性模式不依赖
+  LLM（与 /expert 命令解析同风格）; 静默零事件（与 G1 同构）; 同轮终态放行旗标
+  例外不变（st.redispatch_due 非空时问句也照分类, owner 策略 B 重派路径不阻断）。
+  范围纪律: 祈使操作词（>4 字指令词）不在本轮面（G1b 候选, 硬词表=维护陷阱）。
+  宿主零改动。
 
 设计:
 - Turn 1（v1 现况不变）: 分类 → 锚点专家 X，X 全文注入一次。
@@ -181,6 +190,19 @@ _MIN_SUBSEQ_LEN = 4
 # 说明（v2.7 G1 定稿）: 护栏条件是「短消息 且 st.redispatch_due 为空」——
 # 会话存在未履约的终态重派义务（v2.4.3 owner 策略 B）时短消息也必须分类,
 # 否则 lost/failed 同轮重派路径被跳过（test_subagent_lifecycle 回归实证）。
+# v2.9-c: 问句前置门（owner 裁决 2026-11-18 "A+C" 之 A, 子专家取证 v2.8-c 候选②）:
+# 后续轮状态/元问句（"完成了吗" "接下来呢" "为什么…"）不是新域任务——答问题的
+# 价值在主进程整合, 子专家盲并行会话 = 误路由噪声（11-18 活体三点实证:
+# "完成了吗"→writing 0.95 / "推，然后继续"→eng 0.85 / "已重启…接下来呢？"）。
+# 确定性模式（句尾 ？/?/吗/呢/嘛 或 句首疑问词）, 静默跳过（零事件, 与 G1 同构）;
+# 同轮终态放行旗标例外不变（redispatch_due 非空时问句也照分类）。
+# 范围纪律: 祈使操作词（>4 字指令词）不在本轮面——用户控制词表开放, 硬词表=
+# 维护陷阱（记 G1b 候选）; "帮我修一下吗" 类任务+问句尾跳过属可接受（主专家
+# 当轮自答, 子专家可 /expert 显式补）。
+_QUESTION_RE = re.compile(
+    r"^(为什么|为何|为啥|是不是|有没有|是否|能否|可否|接下来|下一步)"
+    r"|[？?]$"
+    r"|(吗|呢|嘛)$")
 # v2.7 F2: post 模式 pending 滞留阈值（秒）——超过 = post hook 未 fire / worker 崩,
 # 记 pending-stuck 诊断（pending 保留, 迟到的 post 仍可恢复 launch）
 _PENDING_STUCK_SECONDS = 300
@@ -1143,7 +1165,10 @@ def _make_hook(ctx: Any):
         # 的"消息分类到新域时同轮重派"路径被护栏跳过（test_subagent_lifecycle 钉死）。
         # 旗标只做分类放行, 不触发任何强制重派（锚点域消息不自动重派, 交接卡归主专家
         # 决策——test_l3_failed_handoff_card 等钉死）。首轮 10 字问候守卫在上方分支, 不变。
-        if len(msg.strip()) < _MIN_SUBSEQ_LEN and not st.redispatch_due:
+        # v2.9-c 问句前置门: 状态/元问句静默跳过 aux（零事件, 与 G1 同构）; 同轮终态
+        # 放行旗标例外不变——st.redispatch_due 非空时问句/短消息都必须照分类。
+        if not st.redispatch_due and (
+                len(msg.strip()) < _MIN_SUBSEQ_LEN or _QUESTION_RE.search(msg.strip())):
             category, confidence = None, 0.0
         else:
             category, confidence = _classify(ctx, msg)
@@ -1292,5 +1317,5 @@ def register(ctx) -> None:
     # v2.6 P1: post_llm_call（launch_timing=post 时主专家回复后真 launch;
     # 缺省 pre 模式三重 no-op 门, 零行为变化）
     ctx.register_hook("post_llm_call", _make_post_hook(ctx))
-    logger.info("intent-router v%s registered (anchor + sub-expert dispatch via subagent-lifecycle + delegation-ledger + card reinjection + /expert + anchor_inject + refused-observability + lifecycle-absent diagnostics + launch-timing post + lost-filemem-recovery)",
+    logger.info("intent-router v%s registered (anchor + sub-expert dispatch via subagent-lifecycle + delegation-ledger + card reinjection + /expert + anchor_inject + refused-observability + lifecycle-absent diagnostics + launch-timing post + lost-filemem-recovery + question-pre-gate)",
                 _manifest_version())
