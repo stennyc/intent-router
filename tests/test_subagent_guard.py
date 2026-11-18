@@ -55,14 +55,10 @@ class _FakeCtx:
         self.dispatch_calls = []
         self.hooks = {}
         self._n = 0
-        self.lifecycle_svc = None
         self.dispatch_result = None
 
     def register_hook(self, name, fn):
         self.hooks[name] = fn
-
-    def subagent_lifecycle(self):
-        return self.lifecycle_svc
 
     def dispatch_tool(self, tool_name, args, **kw):
         self.dispatch_calls.append((tool_name, args, kw))
