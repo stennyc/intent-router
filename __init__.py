@@ -36,6 +36,12 @@ owner 裁决（2026-11-16，记录于代码）:
   默认 profile 下 = 错误专家全文注入子 agent + 孙代级联派发。修复: hook 入口
   `parent_session_id or platform == "subagent"` 短路（OR 语义, 宿主零改动），
   每 session 记一次 subagent-guard 审计事件。
+- 持久层自动捞回（v2.8 G3, owner 裁决 2026-11-18「动手」）: lost 卡「只有指示没有动作」
+  + G1 缺口（子 agent 工具面无 filemem 族 → launch 提示词「完成时写 filemem」不可执行、
+  静默失效）→ 终态（UNKNOWN ×3 判 lost）时插件只读扫 filemem 中央存储（全分片; delegation_id
+  审计键主匹配 + slug 兜底, fail-soft）, 命中并入卡（「### 持久层自动捞回」append-only 段;
+  lost 卡为终态一次性注入 → 缓存不变量不受影响）; 未命中 base 卡字节稳定（测试钉住）。
+  lost 事件带 filemem_hits/filemem_hit_ids 观测字段。宿主零改动。
 
 设计:
 - Turn 1（v1 现况不变）: 分类 → 锚点专家 X，X 全文注入一次。
@@ -182,6 +188,10 @@ _SESSION_TTL = 3600       # session 状态寿命（秒）
 _SESSIONS_MAX = 256       # LRU 上限
 _RUNNING_TTL = 1800       # running 标志兜底过期（秒）—— 完成消息丢失时防永久卡死
 _UNKNOWN_RETRY_CAP = 3    # v2.4.3: UNKNOWN 连续 N 次才判 lost（宿主 gate 瞬时不匹配给重试窗口）
+# v2.8 G3: lost 时持久层自动捞回——插件侧只读扫 filemem 中央存储（8 profile 共享:
+# junction resolve 回中央池 → parents[2] = 中央 HERMES_HOME）。分片顶层 list-of-rows, fail-soft。
+_FILEMEM_MEMORIES_DIR = Path(__file__).resolve().parents[2] / "filemem" / "memories"
+_FILEMEM_RECOVER_LIMIT = 3   # G3: 并入卡的命中行数上限
 
 # 宿主 async-delegation 完成消息的重入标记。两种形态（live probe 2026-11-16 实证）:
 #   单任务:   "[ASYNC DELEGATION COMPLETE — <delegation_id>]"   (_format_async_delegation)
@@ -440,11 +450,55 @@ def _failed_handoff(slug: str, task_label: str, sid: str, state: str, err: str) 
     )
 
 
-def _lost_pointer(slug: str, sid: str) -> str:
+def _filemem_recover(slug: str, deleg_id: str, limit: int = _FILEMEM_RECOVER_LIMIT) -> list:
+    """v2.8 G3: 终态（lost）持久层自动捞回——只读扫 filemem 中央存储（全分片）, fail-soft。
+    主匹配 = delegation_id 审计键（唯一精确）；无主命中兜底 = slug 子串。
+    返回 [{"id", "shard", "content_excerpt"}...]（≤limit 行）; 目录缺失 / JSON 损坏 → []（绝不影响 hook）。"""
+    if not slug and not deleg_id:
+        return []
+    base = _FILEMEM_MEMORIES_DIR
+    try:
+        if not base.is_dir():
+            return []
+        files = sorted(base.glob("*.json"))
+    except Exception:
+        return []
+    primary: list = []
+    fallback: list = []
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        rows = data if isinstance(data, list) else None
+        if rows is None and isinstance(data, dict):
+            # 防御: 未来 {"rows": [...]} 或 {id: row} 形态（filemem 现行 = 顶层 list）
+            rows = data.get("rows") if "rows" in data else list(data.values())
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            content = str(row.get("content") or "")
+            if not content:
+                continue
+            rec = {"id": str(row.get("id") or ""), "shard": f.stem,
+                   "content_excerpt": content[:300]}
+            if deleg_id and deleg_id in content:
+                primary.append(rec)
+            elif slug and slug in content:
+                fallback.append(rec)
+    return (primary or fallback)[:limit]
+
+
+def _lost_pointer(slug: str, sid: str, recovered: Optional[list] = None) -> str:
     """v2.4.3: UNKNOWN 重试耗尽的诚实指针卡——主进程至少"接"到交代（append-only）。
     v2.4.4 F4: 加 filemem 持久副本检索指引 + 采纳不重做（F2 指示子专家落盘后跨重启可捞回）。
-    v2.5 L3: 升级"交接"语义 + 主专家下一步指令。"""
-    return (
+    v2.5 L3: 升级"交接"语义 + 主专家下一步指令。
+    v2.8 G3: 持久层自动捞回——recovered 非空（filemem 命中）时追加命中段（append-only;
+    lost 卡为终态一次性注入、不重注入 → 缓存不变量不受影响）; 空时 base 卡字节稳定
+    （既有测试钉住）, 检索指引文案继续充当手动兜底。"""
+    base = (
         f"## 子专家交接 ({slug}) — 结果丢失\n"
         f"Host subagent {sid}: result registry entry unavailable after "
         f"{_UNKNOWN_RETRY_CAP} polls (gateway restart cleared the in-process host registry, "
@@ -453,6 +507,13 @@ def _lost_pointer(slug: str, sid: str) -> str:
         f"主专家下一步: 若其成果已落盘, filemem 检索 slug={slug} + 时间窗（审计键 delegation_id={sid}, "
         f"宿主 agent.log/supercompress 亦可查）——找到请采纳/核验而非重做; 未找到请主进程自行处理该项。"
     )
+    if not recovered:
+        return base
+    lines = [f"\n### 持久层自动捞回（G3: filemem 命中 {len(recovered)} 行 —— 采纳/核验, 勿重做）"]
+    for r in recovered:
+        ident = r.get("id") or f"{r.get('shard', '?')}-row"
+        lines.append(f"- filemem {ident}（{r.get('shard', '?')} 分片）: {r.get('content_excerpt', '')}")
+    return base + "\n".join(lines)
 
 
 def _get_lifecycle_service(ctx: Any) -> Tuple[Any, Optional[str]]:
@@ -629,9 +690,16 @@ def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[st
             if st.running.get(slug, ("", 0.0))[0] == sid:
                 del st.running[slug]
         probe = _probe_resolver(frozen)
+        # v2.8 G3: 终态（lost）持久层自动捞回——只读扫 filemem 中央存储（delegation_id
+        # 审计键主匹配 + slug 兜底）, 命中并入卡: "最后防线"不再靠主专家自觉
+        # （G1 缺口: 子 agent 工具面无 filemem 族 → F2 指令不可执行, 自动捞回归主进程侧）
+        recovered = _filemem_recover(slug, sid)
         _log(session_id, "subagent-result-lost", expert=slug, delegation_id=sid,
-             note="unknown-handle", unknown_count=unk, **probe)
-        pieces.append(_lost_pointer(slug, sid))
+             note="unknown-handle", unknown_count=unk,
+             filemem_hits=len(recovered),
+             filemem_hit_ids=[r["id"] for r in recovered if r.get("id")],
+             **probe)
+        pieces.append(_lost_pointer(slug, sid, recovered or None))
         # v2.7: lost 分类放行旗标——findings 未交付, 置位（语义同 failed 分支）
         _rd_cat = _category_of_slug(slug)
         if _rd_cat:
@@ -1224,5 +1292,5 @@ def register(ctx) -> None:
     # v2.6 P1: post_llm_call（launch_timing=post 时主专家回复后真 launch;
     # 缺省 pre 模式三重 no-op 门, 零行为变化）
     ctx.register_hook("post_llm_call", _make_post_hook(ctx))
-    logger.info("intent-router v%s registered (anchor + sub-expert dispatch via subagent-lifecycle + delegation-ledger + card reinjection + /expert + anchor_inject + refused-observability + lifecycle-absent diagnostics + launch-timing post)",
+    logger.info("intent-router v%s registered (anchor + sub-expert dispatch via subagent-lifecycle + delegation-ledger + card reinjection + /expert + anchor_inject + refused-observability + lifecycle-absent diagnostics + launch-timing post + lost-filemem-recovery)",
                 _manifest_version())

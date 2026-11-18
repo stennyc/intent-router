@@ -130,6 +130,8 @@ def env(tmp_path):
     mod._EXPERTS_DIR = experts
     mod._LOG_PATH = tmp_path / "logs" / "dispatches.jsonl"
     mod._fetch_expert_from_github = lambda slug: None
+    # G3 隔离: filemem 指向不存在目录（fail-soft []）, 单测绝不扫真实中央存储
+    mod._FILEMEM_MEMORIES_DIR = tmp_path / "filemem_missing"
     ctx = _FakeCtx()
     return SimpleNamespace(mod=mod, ctx=ctx, experts=experts, log=tmp_path / "logs" / "dispatches.jsonl")
 

@@ -316,3 +316,33 @@ launch_timing 描述。
 测试：`tests/test_review_fixes.py`（6 用例: G1 短消息跳过 + 静默语义 /
 F2 pending-stuck 诊断 + 健康路径不变 / G1×终态新域重派不回归 + 锚点域不强制
 重派）。全量 98 passed（基线 92 + 新增 6, 零回归）。宿主零改动。
+
+## v2.8（2026-11-18，持久层自动捞回 G3 — owner 裁决"动手"，子专家取证报告）
+
+**动机（活体实证 2026-11-18）**: lost 卡「只有指示没有动作」——filemem 检索靠
+主专家 LLM 自觉；且 G1 缺口（子 agent 工具面无 filemem 族）使 launch 提示词
+「完成时写 filemem」（F2 指令）在现行宿主构建下不可执行、静默失效。当日活体
+实例: 重启冲掉注册表 + poll UNKNOWN×3 → lost 卡只给指引, 子专家 1897 字
+findings 靠主进程人肉从盘上备份文件捞回。
+
+**G3（纯插件侧, 宿主零改动）**:
+- `_filemem_recover(slug, deleg_id, limit=3)`: 终态（UNKNOWN×3 判 lost）时只读扫
+  filemem 中央存储（全 5 分片, 顶层 list-of-rows）。主匹配 = delegation_id
+  审计键（唯一精确）; 无主命中兜底 = slug 子串。fail-soft: 目录缺失 /
+  JSON 损坏 / 锁 → [] 且绝不影响 hook。
+- 卡行为: 命中 → lost 卡追加「### 持久层自动捞回（G3: filemem 命中 N 行 …）」
+  （append-only; lost 卡为终态一次性注入、不重注入 → 缓存不变量不受影响）;
+  未命中 → base 卡字节稳定（既有子串断言全数钉住, 零回归）。
+- 观测: `subagent-result-lost` 事件带 `filemem_hits` / `filemem_hit_ids` 字段。
+- 测试隔离: 各测试文件 env fixture 重绑 `mod._FILEMEM_MEMORIES_DIR` 到 tmp
+  （单测绝不扫真实中央存储）。
+
+**明确不做（scope 纪律）**: failed 分支自动捞回（G3b 候选）; 盘上 transcript
+直读（delegation_id→子 session 映射需宿主侧, 归 G2 改动点清单）; 完成即推送
+（G5, 宿主合成重入）。
+
+测试：`tests/test_lost_recovery.py`（7 用例: recover 主匹配/兜底/上限/fail-soft ×4
++ lost 端到端命中并入 / 未命中字节稳定 / 损坏不阻塞清账 ×3）。全量 105 passed
+（基线 98 + 新增 7, 零回归）。宿主零改动。
+活体验收信号: 下次 gateway 重启注册行 `intent-router v2.8.0 registered (…) + lost-filemem-recovery`;
+下次 `subagent-result-lost` 事件带 `filemem_hits`（命中时卡面直接出「持久层自动捞回」段）。
