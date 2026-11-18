@@ -64,6 +64,11 @@ hermes plugins enable intent-router
 ## 验证命令
 
 ```bash
+# 全量测试（规范入口：自动检测活体 hermes 解释器 — $HERMES_HOME/gateway.pid → pid → python.exe；
+# 宿主缺 pytest 会直装，不派生 venv。owner 裁决 2026-11-18：venv 路径随代际漂移，禁止 PATH 猜）
+python run_tests.py
+python run_tests.py --detect-only   # 只看检测到的解释器
+
 # 查看插件状态
 hermes plugins list | grep intent-router
 
