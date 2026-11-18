@@ -455,4 +455,26 @@ owner 裁 **A 案**：regex 整体删除，**不加替代提示词指令**（C �
 "100% 专家形态" = v2 确定性派发（owner 已退役）。活体观察点：下次新域委派, 看子 agent
 goal 是否逐字采用卡面模板 + 是否读了专家文件（`agent.log` 子 session grep `experts/`）。
 
-活体验收信号：下次 gateway 重启注册行 `intent-router v3.3.0 registered (…)`.
+活体验收信号：下次 gateway 重启注册行 `intent-router v3.3.0 registered (…)`。
+
+## v3.3.1（2026-11-18，reviewer 深度复盘 L1/L2 收口 —— owner 裁决「L1+L2 都修」）
+
+**裁决依据（reviewer sa-0-644ff596 对 8bd644e 的独立盘上复盘, 零 med/阻塞项）**：
+- **L1**：「可选建议」字样残留于 `_hint_card` 新 docstring（`__init__.py` L347）——行为零影响
+  （docstring 不进卡面注入文本）, 但与「模块源码 0 残留」验收口径不符。
+- **L2**：v3.3 卡面把数据字段（`- goal:/- context:`）排在纪律/重入指令句**之前**且无边界
+  （无参数化帧）——模型若把整卡当数据照抄, 会把「纪律」「自动重入」指令句扫进子 agent
+  context（子 context 污染, 非破坏性; G6 已证宿主参数面对齐, 无调用错误风险）。
+
+**实现（纯插件, 宿主零改动）**：
+- L1：docstring 口吻描述改「建议式→绑定式」, 「可选建议」在模块源码归零
+  （README 历史节与测试用例为有意留存, 不在归零面; `test_no_advisory_wording_in_module_source` 钉死）
+- L2：指令句（纪律/自动重入）**前移**到数据块之前; 数据块显式参数化为
+  `delegate_task(tasks=[ { "goal": …, "context": … } ])` 帧——data/directive 边界可辨,
+  整块可直接粘贴为调用参数
+- 保留面不变：绑定口吻/单任务纪律/F3 边界/专家路径/filemem+kbs 自取/git 归主进程/压缩重出标记
+
+测试：`test_delegation_hint.py` +3 用例（指令前移序 / 显式参数块 / 模块源码归零）RED 3/3→GREEN;
+全量 **69 passed**, `py_compile` 干净, manifest **3.3.1**。
+
+活体验收信号：下次 gateway 重启注册行 `intent-router v3.3.1 registered (…)`。

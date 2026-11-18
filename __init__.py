@@ -344,24 +344,31 @@ def _hint_visible(st: _SessionState, conversation_history: Any) -> bool:
 def _hint_card(slug: str, category: str, confidence: float, user_message: str) -> str:
     """v3.3 绑定式委派提示卡（owner 裁决 2026-11-18: 治「委派了但模板没被采用」——
     活体实证 8497e1: 模型自写 goal 丢了专家形态, 子专家从未读专家文件）:
-    - 口吻从「可选建议」升为**绑定**: 原样采用 goal/context 两字段, 勿改写/勿删减
+    - 口吻从建议式升为**绑定式**: 原样采用 goal/context 两字段, 勿改写/勿删减
     - 调度纪律: 一次只委派一个任务, 勿创建占位/备用子 agent（实证 7ad9c4）
     - goal 明写 F3 边界: 勿重做主进程已在做的工作（治「各做各的」）
+    - v3.3.1（reviewer 复盘 L1/L2）: 指令句（纪律/自动重入）前移至数据块之前;
+      数据块显式参数化为 delegate_task(tasks=[{...}]) 帧, 数据/指令边界可辨,
+      模型照抄数据块不会把指令句扫进子 agent context
     append-only 尾部加法, 缓存安全。"""
     expert_path = _EXPERTS_DIR / f"{slug}.md"
     task = _task_label(user_message)
     return (
         f"## 委派提示（新域: {category}）\n"
-        f"检测到新领域 {category}（专家 slug={slug}, conf={confidence}）。"
-        f"如委派, 请**原样采用**下面 delegate_task 的 tasks[0] 两个字段（勿改写 goal、勿删减 context）:\n"
-        f"- goal: 作为 {category} 领域专家（{slug}）执行以下任务: {task}。"
-        f"只交付 findings/结果, 勿重做主进程已在做的工作。\n"
-        f"- context: 1) 先读专家文件 {expert_path}（file 工具; 若文件不存在则在结果中说明, "
-        f"勿从网络拉取）; 2) 动手前自取持久上下文: 用 filemem_search 与 kb_search_central "
-        f"查与本任务相关的 {category} 域事实; 3) 只交付 findings, 不做 git commit/push"
-        f"（git 归主进程）。\n"
-        f"纪律: 一次只委派一个任务——勿创建占位/备用/no-op 子 agent。"
+        f"检测到新领域 {category}（专家 slug={slug}, conf={confidence}）。\n"
+        f"纪律: 一次只委派一个任务——勿创建占位/备用/no-op 子 agent。\n"
         f"结果由宿主自动重入（无需轮询）; 不委派则主进程直接自答亦可。\n"
+        f"如委派, 请**原样采用**下面参数块（勿改写 goal、勿删减 context）:\n"
+        f"delegate_task(tasks=[\n"
+        f"  {{\n"
+        f'    "goal": "作为 {category} 领域专家（{slug}）执行以下任务: {task}。'
+        f'只交付 findings/结果, 勿重做主进程已在做的工作",\n'
+        f'    "context": "1) 先读专家文件 {expert_path}（file 工具; 若文件不存在则在结果中说明, '
+        f'勿从网络拉取）; 2) 动手前自取持久上下文: 用 filemem_search 与 kb_search_central '
+        f'查与本任务相关的 {category} 域事实; 3) 只交付 findings, 不做 git commit/push'
+        f'（git 归主进程）"\n'
+        f"  }}\n"
+        f"])\n"
         f"{_HINT_MARKER_FMT.format(slug)}"
     )
 

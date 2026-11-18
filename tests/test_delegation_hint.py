@@ -152,6 +152,40 @@ def test_hint_card_goal_no_repeat_boundary(env):
     assert "勿重做主进程" in r["context"]
 
 
+_HINT_MARKER_PREFIX = "<!--ir-hint:"
+
+
+def test_hint_card_directives_before_data(env):
+    """v3.3.1 L2（reviewer 复盘 finding）: 指令句（纪律/自动重入）排在数据块之前——
+    数据与指令分离, 模型照抄数据块时不会把指令句扫进子 agent context。"""
+    r, _h = _anchor_and_new_domain(env)
+    ctx_text = r["context"]
+    discipline_i = ctx_text.index("一次只委派一个任务")
+    reentry_i = ctx_text.index("自动重入")
+    goal_i = ctx_text.index('"goal"')
+    assert discipline_i < goal_i, "调度纪律句必须出现在数据块之前（指令前移）"
+    assert reentry_i < goal_i, "自动重入句必须出现在数据块之前（指令前移）"
+
+
+def test_hint_card_explicit_argument_block(env):
+    """v3.3.1 L2: 数据块显式 JSON 化为 delegate_task(tasks=[{...}]) 参数块——
+    data/directive 边界可辨, 且模型可直接粘贴整块作为调用参数。"""
+    r, _h = _anchor_and_new_domain(env)
+    ctx_text = r["context"]
+    assert "delegate_task(tasks=[" in ctx_text, "数据块须显式参数化帧"
+    assert '"goal":' in ctx_text and '"context":' in ctx_text, "JSON 式字段键"
+    assert ctx_text.rstrip().endswith(
+        "])\n" + _HINT_MARKER_PREFIX + "engineering-security-engineer-->"), \
+        "参数块闭合后跟审计标记行"
+
+
+def test_no_advisory_wording_in_module_source(env):
+    """v3.3.1 L1（reviewer 复盘 finding）: '可选建议' 字样在模块源码归零
+    （含 docstring）——README 历史节与测试用例为有意留存, 不在此面。"""
+    src = Path(__file__).resolve().parents[1] / "__init__.py"
+    assert "可选建议" not in src.read_text(encoding="utf-8")
+
+
 def test_hint_idempotent_per_domain(env):
     """同域后续轮不再出卡（每 session 每域一次）——hint 轮必须持久化进历史
     （宿主语义: 该轮 user message = 原话 + 注入, 标记随其留存 → 标记可见不再补）。"""
