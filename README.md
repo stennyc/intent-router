@@ -269,3 +269,50 @@ L2 提醒字节稳定 + skip-running 同轮 + UNKNOWN 静默 / L3 recovered·fai
 测试：`tests/test_subagent_guard.py`（6 用例：platform/parent 双信号短路 +
 审计节流 + 默认 profile 事故钉死 + 主 session 双零回归）。全量 83 passed
 （基线 77 + 新增 6，零回归）。宿主零改动。
+
+## v2.6（2026-11-17，P1 分序开关——owner 裁决"时序做"）
+- `launch_timing` 配置开关（缺省 pre, 零行为变化; 注册行版本跟随 manifest 自动变 v2.6）：
+  - **pre（缺省）**: pre_llm_call 当轮真派发（主/子并行, 延迟重叠）——v2.5 现行为。
+  - **post**: pre 轮只分类 + 记 `dispatch-pending`（零派发、零台账卡）；主专家回复后
+    宿主 `post_llm_call`（turn_finalizer, 每 turn 一次）真 launch——通道序列与 pre
+    共用 `_launch_via_channels` 单一来源；成功 → 台账卡顺延下一 pre 轮（post 变体
+    文案"上轮回复后已启动"）；全拒 → 降级注入顺延一轮；`skip-pending` 同域幂等守卫。
+- post 面三重 no-op 门（pre 模式零开销）：子 agent session（platform=subagent OR
+  st.guarded, P0 对称）/ launch_timing!=post / pending 空。
+- 宿主只读实证: post_llm_call kwargs 带 platform 无 parent_session_id（子 session
+  靠双信号识别）; worker 线程 copy_context 继承 → 父 agent contextvar 绑定与 pre
+  时刻等价（v2.4.3 B 冻结快照机制直接复用）; ∈ _HOOK_TIMEOUT_BOUNDED_HOOKS
+  （30s 界内, fail-open）。
+
+测试：`tests/test_launch_timing.py`（9 用例: post 核心时序 / 同域 skip / 全拒降级
+顺延 / 子 session 对称守卫 / pre 缺省零变化 / 双 hook 注册 / 终态轮询不变 +
+F4/F5 review-fix 2 用例）。宿主零改动。
+
+## v2.7（2026-11-17，reviewer 复盘收口——F2/F3/G1）
+**G1 短消息 classify 护栏**（复盘数据点: 单字"修"被 aux 误路由给
+marketing-seo 且过 0.7 gate）:
+- 后续轮 msg < 4 字（strip 后）且会话无同轮终态放行旗标 → 直接跳过 aux 分类
+  （静默, 零事件, 0 成本）——单/双字插话（"修"/"推"/"继续"）无领域信号,
+  误派即噪声；≥4 字照旧分类（"做个安全审查" 6 字不受影响）；首轮 10 字
+  问候守卫不变（独立分支）。
+- **终态放行旗标（`redispatch_due`, v2.4.3 owner 策略 B 协同）**: failed/lost
+  终态（任务未交付）置位 → 当轮短消息也必须分类, 否则"消息分类到新域时同轮
+  重派"路径被护栏阻断（test_unknown_not_cleared_until_retry_cap 回归实证）。
+  旗标**只做分类放行, 不触发强制重派**——锚点域消息不自动重派, 终态交接卡归
+  主专家决策（test_l3_failed_handoff_card / test_lifecycle_result_failed_is_cleared
+  / test_lifecycle_unknown_handle_is_lost 钉死）; 同轮结算即清, 不跨轮泄漏。
+**F2 pending-stuck 诊断**（post 模式可观测缺口: 宿主 post hook 不 fire 则
+pending 永久滞留, 旧码只有反复 skip-pending）:
+- pending 7 元组尾部 + recorded_at; 后续 pre 轮同域且 pending 年龄 > 300s
+  （_PENDING_STUCK_SECONDS）→ 记 `pending-stuck`（带 age_s）替代普通
+  skip-pending; **pending 不清除**——迟到的 post hook 仍可恢复 launch。
+  健康路径（新鲜 pending）行为不变。
+**F3 post 首轮盲性显性化**（纯文档, 零行为变化）: post 模式取舍——主专家
+首轮回复先于 launch 生成（子专家盲起步）, 台账卡到下一条用户消息才送达,
+findings 押在下一轮轮询（gateway 重启宿主注册表消亡, 子专家 filemem 落盘的
+持久检索键是最后防线）; opt-in post 即接受该取舍。已写入 manifest
+launch_timing 描述。
+
+测试：`tests/test_review_fixes.py`（6 用例: G1 短消息跳过 + 静默语义 /
+F2 pending-stuck 诊断 + 健康路径不变 / G1×终态新域重派不回归 + 锚点域不强制
+重派）。全量 98 passed（基线 92 + 新增 6, 零回归）。宿主零改动。

@@ -169,6 +169,15 @@ _ANCHOR_MARKER_FMT = "<!--ir-expert:{}-->"
 _CARD_MARKER_FMT = "<!--ir-card:{}-->"
 
 _CONFIDENCE_GATE = 0.7    # v1 阈值，不变
+# v2.7 G1: 后续轮短消息护栏——单/双字插话（"修"/"推"/"继续"）无领域信号,
+# 低于此长度直接跳过 aux 分类（静默, 零事件, 0 成本）
+_MIN_SUBSEQ_LEN = 4
+# 说明（v2.7 G1 定稿）: 护栏条件是「短消息 且 st.redispatch_due 为空」——
+# 会话存在未履约的终态重派义务（v2.4.3 owner 策略 B）时短消息也必须分类,
+# 否则 lost/failed 同轮重派路径被跳过（test_subagent_lifecycle 回归实证）。
+# v2.7 F2: post 模式 pending 滞留阈值（秒）——超过 = post hook 未 fire / worker 崩,
+# 记 pending-stuck 诊断（pending 保留, 迟到的 post 仍可恢复 launch）
+_PENDING_STUCK_SECONDS = 300
 _SESSION_TTL = 3600       # session 状态寿命（秒）
 _SESSIONS_MAX = 256       # LRU 上限
 _RUNNING_TTL = 1800       # running 标志兜底过期（秒）—— 完成消息丢失时防永久卡死
@@ -185,7 +194,8 @@ _COMPLETION_ID_RE = re.compile(r"\[ASYNC DELEGATION (?:BATCH )?COMPLETE[^\]]*?([
 
 class _SessionState:
     __slots__ = ("anchor", "running", "last_seen", "full_on_next", "lifecycle",
-                 "guard_logged", "guarded", "pending", "ledger_due", "fallback_due")
+                 "guard_logged", "guarded", "pending", "ledger_due", "fallback_due",
+                 "redispatch_due")
 
     def __init__(self) -> None:
         self.anchor: Optional[str] = None
@@ -205,7 +215,8 @@ class _SessionState:
         # v2.6 P1（launch_timing=post）: 子 agent session 标记（pre 守卫打标, post 面双信号之一）
         self.guarded: bool = False
         # v2.6 P1: post 模式 pending 派发 {slug: (category, confidence, task_label,
-        # goal, context_text, expert_path)} —— pre 轮只记账, post_llm_call 真 launch
+        # goal, context_text, expert_path, recorded_at)} —— pre 轮只记账, post_llm_call
+        # 真 launch; v2.7 F2 尾部 recorded_at 供 pending-stuck 滞留时长诊断
         self.pending: Dict[str, tuple] = {}
         # v2.6 P1: post 模式 launch 成功后, 台账卡顺延到下一 pre 轮注入
         # {slug: (delegation_id, task_label, channel)}
@@ -213,6 +224,12 @@ class _SessionState:
         # v2.6 P1: post 模式全拒, 降级专家全文注入顺延到下一 pre 轮
         # {slug: (confidence, task_label, category)}
         self.fallback_due: Dict[str, tuple] = {}
+        # v2.7 G1 协同: 终态（failed/lost）同轮分类放行旗标——终态时置位, 使 G1
+        # 短消息护栏当轮不静默跳过分类（否则 v2.4.3 owner 策略 B "消息分类到新域
+        # 时同轮重派" 路径被护栏阻断）。纯分类放行信号, 不触发任何强制重派
+        # （锚点域消息不自动重派, 交接卡归主专家决策）; 同轮结算即清
+        # （pre hook 分类决策后立即置 None, 不跨轮泄漏）。
+        self.redispatch_due: Optional[Tuple[str, str]] = None
 
 
 _SESSIONS: "OrderedDict[str, _SessionState]" = OrderedDict()
@@ -511,6 +528,14 @@ def _lifecycle_dispatch(ctx: Any, st: _SessionState, session_id: str,
     return sid
 
 
+def _category_of_slug(slug: str) -> Optional[str]:
+    """v2.7: slug → category 反查（重派义务记账存 (slug, category) 形态; fail-soft None）。"""
+    for cat, s in CATEGORY_MAP.items():
+        if s == slug:
+            return cat
+    return None
+
+
 def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[str]:
     """v2.4.3: 轮询 lifecycle 通道子专家, 完成即把 findings append 进本轮 context（缓存安全）。
     非终态保留; UNKNOWN（宿主 gate 不匹配/注册表失踪）不再一次清账: 连续
@@ -586,6 +611,12 @@ def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[st
                      state=state, error=err[:300])
                 # v2.5 L3: 失败也是交接——主专家知道子专家没干成, 自行处理或重派
                 pieces.append(_failed_handoff(slug, task_label, sid, state, err[:300]))
+                # v2.7: 终态（failed）分类放行旗标——任务未交付, 置位使 G1 短消息
+                # 护栏当轮放行分类（v2.4.3 owner 策略 B: 消息分类到新域时同轮重派
+                # 接任务; 锚点域消息不强制重派, 交接卡归主专家决策）
+                _rd_cat = _category_of_slug(slug)
+                if _rd_cat:
+                    st.redispatch_due = (slug, _rd_cat)
             continue
         # UNKNOWN: 宿主 gate 不匹配或注册表已清 → 重试窗口（不动 running 守卫——守卫属于原 sid）
         unk += 1
@@ -601,6 +632,10 @@ def _poll_lifecycle(ctx: Any, st: _SessionState, session_id: str) -> Optional[st
         _log(session_id, "subagent-result-lost", expert=slug, delegation_id=sid,
              note="unknown-handle", unknown_count=unk, **probe)
         pieces.append(_lost_pointer(slug, sid))
+        # v2.7: lost 分类放行旗标——findings 未交付, 置位（语义同 failed 分支）
+        _rd_cat = _category_of_slug(slug)
+        if _rd_cat:
+            st.redispatch_due = (slug, _rd_cat)
     return "\n\n".join(pieces) if pieces else None
 
 
@@ -1032,7 +1067,19 @@ def _make_hook(ctx: Any):
         # ── 后续轮: 压缩补注（事件驱动）+ 新域检测（v2 零注入不变量不变） ──
         lifecycle_ctx = _poll_lifecycle(ctx, st, session_id)   # v2.4: lifecycle 通道子专家 findings
         reinject_ctx = _reinject_after_compaction(st, session_id, conversation_history)
-        category, confidence = _classify(ctx, msg)
+        # v2.7 G1: 短消息护栏——单/双字插话（"修"/"推"/"继续"）无领域信号: aux 误路由
+        # = 无意义派发噪声（marketing-seo 接"修" 2026-11-17 实证）。<4 字且本会话
+        # 无同轮终态放行旗标时跳过 aux（静默, 零事件, 0 成本）；≥4 字照旧分类。
+        # 终态放行旗标（st.redispatch_due, _poll_lifecycle 在 failed/lost 时置位）:
+        # 本轮刚有任务未交付的终态 → 短消息也必须分类——否则 v2.4.3 owner 策略 B
+        # 的"消息分类到新域时同轮重派"路径被护栏跳过（test_subagent_lifecycle 钉死）。
+        # 旗标只做分类放行, 不触发任何强制重派（锚点域消息不自动重派, 交接卡归主专家
+        # 决策——test_l3_failed_handoff_card 等钉死）。首轮 10 字问候守卫在上方分支, 不变。
+        if len(msg.strip()) < _MIN_SUBSEQ_LEN and not st.redispatch_due:
+            category, confidence = None, 0.0
+        else:
+            category, confidence = _classify(ctx, msg)
+        st.redispatch_due = None   # v2.7: 旗标是同轮分类放行信号, 结算即清（不跨轮泄漏）
         slug = None
         if category is not None and confidence >= _CONFIDENCE_GATE:
             slug = CATEGORY_MAP.get(category)
@@ -1044,6 +1091,7 @@ def _make_hook(ctx: Any):
                    if timing == "post" else None)
         if slug is None or slug == st.anchor:
             # 仍在锚点域 / 无新域 → 不派发；压缩事件轮仍补注（尾部加法，缓存安全）
+            # v2.7 钉死: 锚点域消息不自动重派刚终态域——终态交接卡归主专家决策
             ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx, due_ctx)
             return {"context": ctx_out} if ctx_out else None
         # 走到这里 ⇒ slug 有效且 ≠ 锚点 ⇒ category 必非 None（slug 由它派生）
@@ -1058,14 +1106,23 @@ def _make_hook(ctx: Any):
                     ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx, due_ctx)
                     return {"context": ctx_out} if ctx_out else None
                 if slug in st.pending:
-                    _log(session_id, "skip-pending", category=category, expert=slug)
+                    # v2.7 F2: 滞留诊断——pending 未 launch 超 _PENDING_STUCK_SECONDS
+                    # （post hook 未 fire / worker 崩）→ pending-stuck（带 age_s）；
+                    # pending 不清除: 迟到的 post hook 仍可恢复 launch
+                    age_s = int(time.time() - st.pending[slug][-1])
+                    if age_s > _PENDING_STUCK_SECONDS:
+                        _log(session_id, "pending-stuck", category=category, expert=slug,
+                             age_s=age_s)
+                    else:
+                        _log(session_id, "skip-pending", category=category, expert=slug)
                     ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx, due_ctx)
                     return {"context": ctx_out} if ctx_out else None
             expert_path, goal, context_text, task_label = _build_dispatch_inputs(
                 st, slug, msg, conversation_history, category)
             with _LOCK:
+                # v2.7 F2: 尾部 + recorded_at（7 元组）——pending-stuck 滞留时长诊断
                 st.pending[slug] = (category, confidence, task_label, goal, context_text,
-                                    expert_path)
+                                    expert_path, time.time())
             _log(session_id, "dispatch-pending", category=category, expert=slug,
                  confidence=confidence)
             ctx_out = _join_ctx(reinject_ctx, lifecycle_ctx, due_ctx)
@@ -1140,7 +1197,8 @@ def _make_post_hook(ctx: Any):
                 st.pending.pop(slug, None)
         if not items:
             return None
-        for slug, (category, confidence, task_label, goal, context_text, expert_path) in items:
+        for slug, (category, confidence, task_label, goal, context_text, expert_path,
+                   _recorded_at) in items:
             _launch_pending(ctx, st, session_id, slug, category, confidence,
                             task_label, goal, context_text, expert_path)
         return None
