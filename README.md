@@ -408,3 +408,26 @@ manifest）此前只落模块层, manifest 版本至此一并补到 3.1.0。
 活体验收信号：下次 gateway 重启注册行 `intent-router v3.1.0 registered (...)`；jsonl 无
 dispatch / 无台账 / 无轮询事件；后续轮新域消息出「委派提示」卡 + `hint` 事件；单字 / 问句
 指令静默。
+
+## v3.2（2026-11-18，问句 regex 退役 —— owner 全球化裁决「全删 regex 不加指令」）
+
+**裁决**：v2.9 引入的 `_QUESTION_RE`（中文疑问词表 `^(为什么|…)|[？?]$|(吗|呢|嘛)$`）
+不适合全球化——疑问形态逐语言不同，扩表 = 无穷打地鼠。且 v3 下它只剩
+「省 1 次 aux 调用 + 防噪声卡」的卫生价值（误派盲 spawn 的危害面已随派发栈退役）。
+owner 裁 **A 案**：regex 整体删除，**不加替代提示词指令**（C 案被否）——问句与普通
+消息同律全量过 aux 分类 + conf gate（0.7），误判出噪声卡可接受（无盲 spawn、尾部
+注入缓存安全、token 成本可不计），低 conf 自然无卡。
+
+**变更面**（纯插件，宿主零改动）：
+
+- 删 `_QUESTION_RE` + 门线（`L584` 现仅剩 G1 长度判断——**G1 保留**：纯长度、语言无关）
+- 模块零中文疑问词残留（`grep 为什么|是不是 → 0`，测试 `test_no_question_regex_in_module` 钉死）
+- **误杀面修复**：旧门静默杀掉的任务型问句（"为什么部署失败"）现在正常分类出提示卡
+- 注册行去 `question-pre-gate` 段；manifest 3.2.0
+- 测试：`test_question_gate.py` 重写为 6 用例退役钉（无 regex / 中文问句照跑 aux /
+  英文问句照跑 aux（语言中立实证）/ 任务型问句不再误杀 / G1 静默保留 / 低 conf 无卡）
+  + `test_delegation_hint.py` 旧问句门用例改为 v3.2 语义（aux 照跑 + 幂等无卡）
+  → 全量 **63 passed ×3**, `py_compile` 干净
+
+**活体效果**：下次 gateway 重启注册行 `intent-router v3.2.0 registered (… + subagent-guard)`；
+英文/中文问句不再有任何差异化静默行为，行为完全由 aux 判断 + conf gate 呈现。

@@ -11,7 +11,7 @@ owner 裁决史（代码内留痕）:
   post hook / 降级注入 / 终态重派旗标（代码留 git 史, 可考古）。
 - 保留面: 锚点专家（v1 首轮字节不变）/ 13 专家卡 + 压缩后补注（v2.1）/
   /expert 手动覆盖（v2.2）/ anchor_inject 开关（v2.3）/ P0 子 session 平台
-  守卫（v2.5.1）/ G1 短消息护栏（v2.7）/ 问句前置门（v2.9-c）/ 完成消息轮
+  守卫（v2.5.1）/ G1 短消息护栏（v2.7; v3.2 起唯一静默门, 问句 regex 已退役）/ 完成消息轮
   跳过检测（循环守卫, v2.0.1 简化保留: 无 running 状态, 纯跳过）。
 - 平台不变: 跨平台零硬编码路径（pathlib 运行时解析 + 显式 utf-8）; 唯一注入面
   是 pre_llm_call 返回 {"context"}（宿主追加到当前轮 user message 尾部, 永不进
@@ -20,7 +20,7 @@ owner 裁决史（代码内留痕）:
 设计（v3）:
 - Turn 1: 分类 → 锚点专家 X 全文注入一次（v1 字节级不变; anchor_inject=false
   的域 profile 跳过; /expert 手动切换不受开关影响）。
-- 之后每轮: G1 短消息护栏 + 问句门（静默跳过 aux）→ aux 分类:
+- 之后每轮: G1 短消息护栏（静默跳过 aux）→ aux 分类:
     == 锚点 / null / conf < 0.7 → 零动作
     == Y ≠ 锚点 且 conf ≥ 0.7 → 注入**委派提示卡**（append-only, 每 session
     每域一次; 压缩后标记丢失 → 再补一次）: 告知新域/专家 slug + delegate_task
@@ -146,18 +146,12 @@ _HINT_MARKER_FMT = "<!--ir-hint:{}-->"
 
 _CONFIDENCE_GATE = 0.7    # v1 阈值，不变
 # G1（v2.7 保留）: 后续轮短消息护栏——单/双字插话（"修"/"推"/"继续"）无领域
-# 信号, 低于此长度直接跳过 aux 分类（静默, 零事件, 0 成本）。v3 下 G1 治的是
-# "误提示"噪声（不再驱动 spawn, 但驱动 aux 分类 + 提示卡）。
-# 终态重派旗标例外已随 v2.4.3 策略 B 退役（v3 无终态）。
+# 信号, 低于此长度直接跳过 aux 分类（静默, 零事件, 0 成本）。语言无关（纯长度判断）。
+# 问句门（v2.9-c 中文 regex）已随 v3.2 owner 裁决「全删 regex 不加指令」退役:
+# 全球化批评成立（疑问形态逐语言不同, 扩表 = 打地鼠）+ v3 下误提示无害
+# （无盲 spawn, 尾部注入缓存安全, token 成本可不计）→ 问句与普通消息同律过
+# aux + conf gate; 误杀面（任务型问句被静默跳杀）同时修复。
 _MIN_SUBSEQ_LEN = 4
-# 问句前置门（v2.9-c 保留）: 后续轮状态/元问句（"完成了吗" "接下来呢" "为什么…"）
-# 静默跳过 aux 分类 —— 答问题的价值在主进程整合, 误提示 = 噪声。确定性模式
-# （句尾 ？/?/吗/呢/嘛 或 句首疑问词）, 不依赖 LLM; 静默零事件（与 G1 同构）。
-# 范围纪律: 祈使操作词（>4 字指令词）不在面（硬词表 = 维护陷阱, G1b 候选）。
-_QUESTION_RE = re.compile(
-    r"^(为什么|为何|为啥|是不是|有没有|是否|能否|可否|接下来|下一步)"
-    r"|[？?]$"
-    r"|(吗|呢|嘛)$")
 
 _SESSION_TTL = 3600       # session 状态寿命（秒）
 _SESSIONS_MAX = 256       # LRU 上限
@@ -579,9 +573,10 @@ def _make_hook(ctx: Any):
 
         # ── 后续轮: 压缩补注（事件驱动）+ 新域检测 → 委派提示卡（v3 模型驱动） ──
         reinject_ctx = _reinject_after_compaction(st, session_id, conversation_history)
-        # G1 短消息护栏 + 问句前置门（静默跳过 aux, 零事件）: 单/双字插话与状态/
-        # 元问句无新域任务信号 —— 误提示即噪声。v3 无终态重派旗标, 护栏无条件。
-        if len(msg.strip()) < _MIN_SUBSEQ_LEN or _QUESTION_RE.search(msg.strip()):
+        # G1 短消息护栏（v3.2 起唯一静默门: 纯长度判断, 语言无关）: 单/双字插话
+        # 无新域任务信号 → 跳过 aux（零事件）。问句不再特殊化（v2.9 regex 退役,
+        # owner 裁决 2026-11-18 全球化）—— 与普通消息同律过 aux + conf gate。
+        if len(msg.strip()) < _MIN_SUBSEQ_LEN:
             category, confidence = None, 0.0
         else:
             category, confidence = _classify(ctx, msg)
@@ -623,5 +618,5 @@ def register(ctx) -> None:
     """插件注册入口（宿主加载时调用一次）。v3: 只注册 pre_llm_call（post 分序面
     随 launch_timing 退役——无插件 spawn 即无需 post 时点）。"""
     ctx.register_hook("pre_llm_call", _make_hook(ctx))
-    logger.info("intent-router v%s registered (anchor + delegation-hint (model-driven delegate_task) + card reinjection + /expert + anchor_inject + question-pre-gate + subagent-guard)",
+    logger.info("intent-router v%s registered (anchor + delegation-hint (model-driven delegate_task) + card reinjection + /expert + anchor_inject + subagent-guard)",
                 _manifest_version())

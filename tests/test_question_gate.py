@@ -1,12 +1,13 @@
-"""intent-router v2.9/v3.0 — 问句前置门（TDD suite）。
+"""intent-router v3.2 — 问句门退役（TDD suite）。
 
-Owner 裁决（2026-11-18 复盘数据点: "完成了吗" 误路由 writing,
-"推，然后继续" 误路由 eng）: 后续轮以问句模式开头的消息先于 aux 分类
-静默跳过（零事件、零 aux 烧钱、无提示）—— 问句/状态句的价值在主进程
-整合, 不是再拉一个盲子会话。
-
-v3 注: "跳过"语义在 v3 下等价于"跳过提示"（确定性派发已退役,
-问句门保护的是 aux 分类调用本身）。
+Owner 裁决（2026-11-18「全删 regex 不加指令」, 全球化批评）:
+- _QUESTION_RE 中文硬编码表整体删除（不适合全球化: 疑问形态逐语言不同,
+  扩表 = 无穷打地鼠; 且 v3 下误提示无害——无盲 spawn, 尾部注入缓存安全,
+  token 成本可不计）
+- 不加替代提示词指令（C 案被否）: 问句消息与普通消息同律, 全量过
+  aux 分类 + conf gate（0.7）—— 误判出噪声卡可接受, 低 conf 自然无卡
+- 误杀面修复: 旧门静默跳过的任务型问句（"为什么部署失败"）现在正常分类出卡
+- G1 长度护栏（语言无关）保留: <4 字插话仍静默零 aux
 """
 import importlib.util
 import json
@@ -18,7 +19,7 @@ import pytest
 
 def _load_plugin():
     root = Path(__file__).resolve().parents[1]
-    spec = importlib.util.spec_from_file_location("intent_router_qgate", root / "__init__.py")
+    spec = importlib.util.spec_from_file_location("intent_router_v32", root / "__init__.py")
     assert spec is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -100,44 +101,60 @@ def _events(env):
     return [json.loads(line)["event"] for line in env.log.read_text(encoding="utf-8").splitlines()]
 
 
-def test_question_pattern_table(env):
-    """门 = 纯模式表（owner 钉死, 无关键词白名单）: 表内即跳, 表外过。
-    样例必须与模块 _QUESTION_RE 的现行表对齐（v2.9 定稿, 不凭记忆扩表）。"""
-    re_mod = env.mod
-    assert re_mod._QUESTION_RE is not None
-    for q in ("完成了吗", "都完成了吗", "是不是搞定了", "为什么不行", "是否可行",
-              "下一步做什么", "可以推吗", "行吗"):
-        assert re_mod._QUESTION_RE.search(q.strip()), f"漏判: {q!r}"
-    for t in ("把注入修掉", "推送", "开始写", "帮我写个 REST 后端 API", "继续查"):
-        assert not re_mod._QUESTION_RE.search(t.strip()), f"误杀: {t!r}"
+def test_no_question_regex_in_module(env):
+    """A 红线钉死: 模块无 _QUESTION_RE, 源码无中文疑问词表（语言中立）。"""
+    assert not hasattr(env.mod, "_QUESTION_RE")
+    src = (Path(__file__).resolve().parents[1] / "__init__.py").read_text(encoding="utf-8")
+    for word in ("为什么", "是不是", "吗|呢|嘛"):
+        assert word not in src, f"模块仍残留中文问句模式: {word}"
 
 
-def test_question_ending_skips_classify_silently(env):
-    """后续轮问句结尾 → 跳过分类+提示: 零 aux、零事件、零注入。"""
+def test_status_question_now_classified(env):
+    """状态问句不再静默: 全量过 aux（C 否案 = 不加指令, 靠 conf gate 自然滤）。"""
     ctx1 = _anchor(env)
+    env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
     n_calls = len(env.ctx.llm.calls)
     r = _turn(env, "完成了吗", first=False, history=[_user_msg(ctx1)])
+    assert len(env.ctx.llm.calls) == n_calls + 1, "问句必须过 aux 分类（无前置 regex）"
+    assert r is not None and "委派提示" in r["context"]
+
+
+def test_english_question_now_classified(env):
+    """语言中立实证: 英文问句不再被 [？?]$ 特殊拦截, 同律过 aux。"""
+    ctx1 = _anchor(env)
+    env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
+    n_calls = len(env.ctx.llm.calls)
+    r = _turn(env, "did it finish?", first=False, history=[_user_msg(ctx1)])
+    assert len(env.ctx.llm.calls) == n_calls + 1
+    assert r is not None and "委派提示" in r["context"]
+
+
+def test_task_question_no_longer_mis_skipped(env):
+    """误杀面修复: 旧门静默跳过的任务型问句（句首'为什么'）现在正常分类出卡。"""
+    ctx1 = _anchor(env)
+    env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
+    n_calls = len(env.ctx.llm.calls)
+    r = _turn(env, "为什么部署失败", first=False, history=[_user_msg(ctx1)])
+    assert len(env.ctx.llm.calls) == n_calls + 1
+    assert r is not None and "委派提示" in r["context"]
+
+
+def test_g1_short_message_still_silent(env):
+    """G1 长度护栏（语言无关）保留: <4 字插话仍零 aux 零事件。
+    注: 历史必须带锚点标记（宿主语义）, 否则触发的是合法的压缩补注。"""
+    ctx1 = _anchor(env)
+    n_calls = len(env.ctx.llm.calls)
+    r = _turn(env, "修", first=False, history=[_user_msg(ctx1)])
     assert r is None
-    assert len(env.ctx.llm.calls) == n_calls, "问句门必须先于 aux 分类"
+    assert len(env.ctx.llm.calls) == n_calls, "G1 必须先于 aux（不烧分类）"
     assert _events(env) == ["anchor"], "静默 = 零新事件"
 
 
-def test_question_lead_word_skips_classify(env):
-    """领字式问句（'是不是…'）同律静默跳过。"""
+def test_low_conf_message_no_card(env):
+    """无指令替代: 低 conf 消息靠 conf gate 自然不出卡（aux 仍照跑）。"""
     ctx1 = _anchor(env)
+    env.ctx.llm.scripts = [{"category": "security", "confidence": 0.3}]
     n_calls = len(env.ctx.llm.calls)
-    r = _turn(env, "是不是搞定了", first=False, history=[_user_msg(ctx1)])
-    assert r is None
-    assert len(env.ctx.llm.calls) == n_calls
-
-
-def test_imperative_task_still_classifies(env):
-    """陈述式任务指令不受门影响（该过 gate 就过, 出提示）。"""
-    ctx1 = _anchor(env)
-    env.ctx.llm.scripts = [
-        {"category": "security", "confidence": 0.9},
-    ]
-    r = _turn(env, "帮我写个 SQL 注入检测脚本", first=False, history=[_user_msg(ctx1)])
-    assert len(env.ctx.llm.calls) == 2, "陈述句必须正常烧一次分类"
-    assert r is not None and "委派提示" in r["context"]
-    assert env.ctx.dispatch_calls == []
+    r = _turn(env, "还有别的坑吗", first=False, history=[_user_msg(ctx1)])
+    assert len(env.ctx.llm.calls) == n_calls + 1
+    assert r is None, "conf < gate → 无 hint 卡"

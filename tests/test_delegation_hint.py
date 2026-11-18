@@ -196,14 +196,15 @@ def test_g1_short_message_skips_silently(env):
     assert len(_events(env)) == evs_before, "G1 必须静默零事件"
 
 
-def test_question_gate_skips_silently(env):
-    """问句门: 状态/元问句 → 静默跳过（零分类、零事件、零提示）。"""
+def test_question_now_classified_not_skipped(env):
+    """v3.2 问句门退役: 问句不再静默跳过 —— aux 照跑（calls +1 即门消失的证据）;
+    本案脚本耗尽（aux 返回 null）+ 该域已提示 → 无卡无新事件。"""
     _anchor_and_new_domain(env)
     calls_before = len(env.ctx.llm.calls)
     evs_before = len(_events(env))
     r = _turn(env, "完成了吗", first=False)
     assert r is None
-    assert len(env.ctx.llm.calls) == calls_before
+    assert len(env.ctx.llm.calls) == calls_before + 1, "问句门已退役: aux 必须照跑"
     assert len(_events(env)) == evs_before
 
 
