@@ -376,3 +376,35 @@ findings 靠主进程人肉从盘上备份文件捞回。
 活体验收信号: 下次 gateway 重启注册行 `intent-router v2.9.0 registered`; 后续轮发
 "完成了吗" 类问句 → jsonl 无 classify、无 dispatch、无台账卡（静默生效），任务型
 消息（非问句）派发行为不变。
+
+## v3.0 / v3.1（2026-11-18，owner 裁决：委派判断归模型 —— 确定性派发栈退役）
+
+**裁决**（owner, 本会话）：不修宿主；LLM 在自己的工具面 spawn 子 agent
+（`delegate_task`），宿主免费重入交结果；插件的职责 = 给信号。世界观标准（owner 注入）：
+任何机制的最高评价标准 = 对编程的价值。
+
+**退役面**（v2.4–v2.8 全通道栈, 代码删除; 活体取证记录保留在 git 历史）：
+lifecycle spawn / 轮询三态清账 / G3 持久层自动捞回 / 分工台账卡 / launch_timing + post hook
+/ 降级注入 / dispatch-refused 观测。注册面回归 `pre_llm_call` 单一 hook。
+
+**新增面：委派提示卡**（append-only 尾部, 缓存安全）：后续轮新域过 conf gate 时注入
+`## 委派提示（新域: X）`——delegate_task 调用模板（goal 带专家 slug + 任务原话；context
+带专家文件路径 + filemem/kbs 自取指引 + git 归主进程约束）+「结果宿主自动重入, 不委派也可
+自答」。幂等：每 (session, 域) 一次；压缩后 `<!--ir-hint:slug-->` 标记丢失 → 再补一次
+（与 v2.1 卡补注同构）。完成重入轮（`[ASYNC DELEGATION ...]`）一律 completion-skip
+（v2.0.1 循环守卫简化形态：v3 无 running 状态可清, 只防 检测→提示→委派→重入→再检测 噪声环）。
+
+**保留面**：锚点专家（v1 字节不变）/ 13 张专家卡 + 压缩补注 / /expert / anchor_inject /
+P0 子 session 守卫 / G1 短消息护栏 / 问句前置门（v2.9, 静默零事件）。事件词汇面从此只有：
+`anchor / anchor-disabled / manual-* / card-reinject / full-reinject* / hint / completion-skip /
+subagent-guard`。
+
+**v3.1 收口（本次）**：测试全量配套 —— 6 个 v2 通道测试文件删除（`test_dispatch_refused /
+test_subagent_lifecycle / test_delegation_ledger / test_lost_recovery / test_launch_timing /
+test_review_fixes`）, 6 个存活文件改写 + `test_delegation_hint.py`（12 用例）→ 全量
+**61 passed ×3 连跑**, `py_compile` 干净, 宿主零改动。注：v3.0.1（鸭子类型 + 注册行跟
+manifest）此前只落模块层, manifest 版本至此一并补到 3.1.0。
+
+活体验收信号：下次 gateway 重启注册行 `intent-router v3.1.0 registered (...)`；jsonl 无
+dispatch / 无台账 / 无轮询事件；后续轮新域消息出「委派提示」卡 + `hint` 事件；单字 / 问句
+指令静默。

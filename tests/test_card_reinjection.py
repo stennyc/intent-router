@@ -189,8 +189,8 @@ def test_no_anchor_no_reinjection(env):
     ]
     assert _turn(env, "随便聊聊", first=True) is None
     r = _turn(env, "查一下注入", first=False, history=[_user_msg("[压缩摘要]")])
-    # v2.5 L1: 无锚点 → 无补卡（测试意图不变, "card-reinject" 不得出现）; 派发轮出台账卡
-    assert r is not None and "分工台账" in r["context"]
+    # v3: 无锚点 → 无补卡（测试意图不变, "card-reinject" 不得出现）; hint 轮出提示卡
+    assert r is not None and "委派提示" in r["context"]
     assert "card-reinject" not in _events(env)
 
 
@@ -203,29 +203,35 @@ def test_empty_history_followup_never_reinjects(env):
 
 
 def test_synthetic_completion_turn_never_reinjects(env):
-    """合成完成轮被循环守卫先行拦截 —— 即使历史同时缺标记也不补注。"""
+    """v3: 完成重入轮被 completion-skip 先行拦截 —— 即使历史缺标记也不补注 / 不重出 hint。"""
     ctx1 = _first_turn_ctx(env)
     env.ctx.llm.scripts = [
         {"category": "security", "confidence": 0.9},
+        {"category": "security", "confidence": 0.9},
     ]
-    _turn(env, "查一下这个 API 的 SQL 注入", first=False, history=[_user_msg(ctx1)])
-    assert len(env.ctx.dispatch_calls) == 1
+    r1 = _turn(env, "查一下这个 API 的 SQL 注入", first=False, history=[_user_msg(ctx1)])
+    assert r1 is not None and "委派提示" in r1["context"]
+    assert env.ctx.dispatch_calls == []
     r = _turn(env, _completion_msg("deleg_0001"), first=False,
               history=[_user_msg("[压缩摘要]")])
     assert r is None
     assert "card-reinject" not in _events(env)
+    assert _events(env).count("hint") == 1, "完成轮不得重出 hint（幂等）"
+    assert "completion-skip" in _events(env)
 
 
-def test_compression_and_dispatch_same_turn(env):
-    """压缩轮用户同时问新域 → 补注 + 派发同轮完成（补注是尾部加法，派发是后台副作用）。"""
+def test_compression_and_hint_same_turn(env):
+    """v3: 压缩轮用户同时问新域 → 补卡 + 提示卡同轮完成（都是尾部加法, 宿主零派发副作用）。"""
     ctx1 = _first_turn_ctx(env)
     env.ctx.llm.scripts = [
         {"category": "security", "confidence": 0.9},
     ]
     r = _turn(env, "查一下这个 API 的 SQL 注入", first=False,
                history=[_user_msg("[压缩摘要]")])
-    assert len(env.ctx.dispatch_calls) == 1
+    assert env.ctx.dispatch_calls == []
     assert r is not None and "CARD-BACKEND-BODY" in r["context"]
+    assert "委派提示" in r["context"]
+    assert "card-reinject" in _events(env)
 
 
 def test_reinjection_does_not_mutate_history(env):

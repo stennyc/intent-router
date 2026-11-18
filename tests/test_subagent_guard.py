@@ -169,7 +169,7 @@ def test_default_profile_subagent_first_turn_no_wrong_expert_injection(env):
 # ── 主 session 零回归 ───────────────────────────────────────────────────────
 
 def test_main_session_pipeline_unaffected(env):
-    """主 session（无 parent, 非 subagent platform）全流水线照旧: 锚点 + 派发。"""
+    """主 session（无 parent, 非 subagent platform）全流水线照旧: 锚点 + 委派提示（v3）。"""
     env.ctx.llm.scripts = [
         {"category": "engineering", "confidence": 0.9},
         {"category": "security", "confidence": 0.9},
@@ -177,8 +177,8 @@ def test_main_session_pipeline_unaffected(env):
     r1 = _turn(env, "帮我写个 REST 后端 API", first=True, session_id="main-1")
     assert r1 is not None and "BACKEND-EXPERT-BODY" in r1["context"]
     r2 = _turn(env, "做个安全审查", first=False, session_id="main-1")
-    d = [e for e in _events(env) if e["event"] == "dispatch"]
-    assert d, "主 session 派发面不得被守卫误伤"
+    h = [e for e in _events(env) if e["event"] == "hint"]
+    assert h, "主 session hint 面不得被守卫误伤"
     assert not [e for e in _events(env) if e["event"] == "subagent-guard"], "主 session 不得记 guard 事件"
 
 

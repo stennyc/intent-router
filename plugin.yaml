@@ -1,6 +1,6 @@
 name: intent-router
-version: "2.9.0"
-description: "动态专家上下文路由 v2.9.0 — 锚点专家固定注入 + 新领域子专家派发（宿主 subagent-lifecycle 通道, gateway 模式真子 agent + 结果轮询交付）+ 分工台账（派发同轮台账卡 + 运行期提醒 + 终态交接卡, 主专家全程知道子专家在做什么）+ 平台守卫（子 agent session 回合短路, 防错误专家注入 + 孙代级联）+ 旧通道拒绝观测 + 降级注入 + lifecycle-absent 诊断 + 压缩后蒸馏卡补注 + /expert 手动覆盖 + anchor_inject/launch_timing 配置开关（v2.6 launch_timing=post 时真 launch 顺延到 post_llm_call）+ 短消息 classify 护栏（v2.7 G1: 后续轮 <4 字插话跳过 aux 治单字误路由噪声, 同轮终态放行旗标例外不阻断 v2.4.3 同轮重派）+ pending-stuck 诊断（v2.7 F2: post 模式 pending 滞留 >300s 记事件, 可观测宿主 post hook 缺席）+ 持久层自动捞回（v2.8 G3: lost 终态只读扫 filemem 中央存储, delegation_id 审计键主匹配 + slug 兜底, 命中并入交接卡, 未命中 base 卡字节稳定）+ 问句前置门（v2.9-c: 后续轮状态/元问句静默跳过 aux 分类, 句尾？/?/吗/呢/嘛 或 句首疑问词确定性模式, 同轮终态放行旗标例外, 治「完成了吗」式误派噪声）"
+version: "3.1.0"
+description: "动态专家上下文路由 v3.1.0 — 锚点专家固定注入 + 委派提示卡（模型驱动委派, owner 裁决 2026-11-18: 新域过 gate 时 append-only 提示卡, 模型自己调宿主 delegate_task 拉子专家, 结果宿主自动重入, 插件零 spawn）+ 压缩后蒸馏卡补注 + 完成重入轮 completion-skip + /expert 手动覆盖 + anchor_inject 配置开关 + P0 子 session 平台守卫 + G1 短消息护栏 + 问句前置门（静默跳过 aux 分类）"
 author: hermes-agent
 license: MIT
 config_schema:
@@ -8,7 +8,3 @@ config_schema:
     type: bool
     default: true
     description: 首轮自动锚点注入开关。profile 的 SOUL.md 已含专家 persona（域 profile）时设 false：跳过首轮分类+注入（免重复+免稀释），/expert 手动切换不受影响。
-  launch_timing:
-    type: string
-    default: pre
-    description: "子专家真 launch 时序。pre（缺省）= pre_llm_call 当轮真派发（主/子并行, 延迟重叠）；post = pre 轮只记 pending, 主专家回复后 post_llm_call 才真 launch（台账卡/降级注入顺延下一轮）。取舍（v2.7 F3 显性化）: post 模式下主专家首轮回复先于 launch 生成——子专家盲起步, 台账卡到下一条用户消息才送达, findings 押在下一轮轮询（gateway 重启宿主注册表消亡, filemem 持久键是最后防线）；opt-in post 即接受该取舍。缺省 pre 行为与 v2.5 完全一致。"

@@ -4,7 +4,7 @@ Owner 裁决（2026-11-17）: profile 的 SOUL.md 已含专家 persona 时（域
 第一轮自动锚点注入是纯重复 + 注意力稀释 → per-profile 配置关闭:
   plugins.entries.intent-router.settings.anchor_inject: false
 - false = 首轮跳过分类+注入（省 aux 调用），anchor 保持 None → 后续轮无锚点模式
-  （新域照旧派子专家；压缩补注不触发）
+  （v3 起新域只出委派提示；压缩补注不触发）
 - /expert 手动切换不受开关影响（显式指令 > 隐式自动）
 - 缺省 / 配置读取异常 = true（fail-soft 保守默认，行为与 v2.2 一致）
 
@@ -116,14 +116,14 @@ def test_off_skips_first_turn_classification_and_injection(env):
     assert "anchor-disabled" in _events(env)
 
 
-def test_off_followup_no_anchor_dispatch_still_works(env):
-    """无锚点模式: 新域任务照旧派子专家（深度隔离不丢），无补注（无锚点）。"""
+def test_off_followup_no_anchor_hint_still_works(env):
+    """v3 无锚点模式: 新域后续只出委派提示（不派发）, 无补注（无锚点）。"""
     env.ctx.settings = {"anchor_inject": False}
     _turn(env, "帮我写个 REST 后端 API", first=True)    # 被跳过
     env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
     r = _turn(env, "查一下这个 API 的 SQL 注入", first=False, history=[_user_msg("x")])
-    assert len(env.ctx.dispatch_calls) == 1
-    assert r is not None and "分工台账" in r["context"]      # v2.5 L1: 无锚点 → 无补注（意图不变）; 派发轮出台账卡
+    assert env.ctx.dispatch_calls == []
+    assert r is not None and "委派提示" in r["context"]
     assert _sessions(env)["s1"].anchor is None
 
 

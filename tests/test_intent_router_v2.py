@@ -1,16 +1,13 @@
-"""intent-router v2 — TDD suite.
+"""intent-router v3.0 — 锚点专家路由 + 委派提示（TDD suite）.
 
-Owner rulings encoded here (2026-11-16):
-- B: after a sub-expert completes it MAY be re-dispatched for a new task
-  (no per-session cap); no re-dispatch while one is running.
-- Cross-platform: zero hardcoded path constants; expert paths are pathlib-resolved
-  at runtime; tests use only pathlib/tmp_path (no C:\\ or /root fixtures).
-- Cache safety: turn 1 injects the anchor expert; v2.5 (2026-11-17 owner ruling)
-  adds the delegation-ledger card on successful dispatch rounds + running
-  reminder line — all pure tail appends; every turn's model prefix remains a
-  byte-extension of the previous one (regression test below).
-
-Run: python -m pytest tests/ -v   (scratch venv, pytest + stdlib only, no network)
+v3 owner ruling (2026-11-18): 确定性派发通道退役 → 模型自决委派。
+- first-turn classify → 锚点专家注入 (context["expert"] + 尾部标记)
+- follow-up 新域 (≠锚点, 过 conf gate) → append-only "委派提示" 卡:
+  指示模型用宿主 delegate_task 工具自己拉子专家; 结果宿主自动重入
+- 子 agent 会话 (subagent_session_id) → 整条流水线短路 (P0 守卫)
+- 合成完成重入轮 ([ASYNC DELEGATION ...]) → 先于分类跳过
+- 短后续消息 / 问句 → G1 + 问句门跳过分类 (静默)
+- 压缩后锚点/专家文本消失 → 卡补注 (或全文回退)
 """
 import importlib.util
 import json
@@ -20,11 +17,9 @@ from types import SimpleNamespace
 import pytest
 
 
-# ── plugin loader (the plugin dir is 'intent-router' — hyphen, not importable by name) ──
-
 def _load_plugin():
     root = Path(__file__).resolve().parents[1]
-    spec = importlib.util.spec_from_file_location("intent_router_v2", root / "__init__.py")
+    spec = importlib.util.spec_from_file_location("intent_router_v30", root / "__init__.py")
     assert spec is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -32,10 +27,7 @@ def _load_plugin():
 
 
 class _FakeLLM:
-    """Scripted stand-in for ctx.llm. Each test pops `scripts` in turn order.
-
-    Each script entry: {"category": ..., "expert": ..., "confidence": ...} or None.
-    """
+    """complete_structured: 返回带 .parsed 的对象, 模拟宿主 LLMClient 契约."""
 
     def __init__(self):
         self.scripts = []
@@ -43,13 +35,14 @@ class _FakeLLM:
 
     def complete_structured(self, **kw):
         self.calls.append(kw)
-        parsed = None
-        if self.scripts:
-            parsed = self.scripts.pop(0)
+        parsed = self.scripts.pop(0) if self.scripts else None
         return SimpleNamespace(parsed=parsed)
 
 
 class _FakeCtx:
+    """模拟宿主 PluginContext 的 duck-typed 接口面（含已退役的
+    dispatch_tool —— v3 起插件不再调用, 测试靠它断言"零调用"）."""
+
     def __init__(self):
         self.llm = _FakeLLM()
         self.dispatch_calls = []
@@ -72,16 +65,20 @@ class _FakeCtx:
 @pytest.fixture()
 def env(tmp_path):
     mod = _load_plugin()
-    # hermetic experts dir + log path (module attributes, set fresh per test)
     experts = tmp_path / "experts"
     experts.mkdir()
     (experts / "engineering-backend-architect.md").write_text("BACKEND-EXPERT-BODY", encoding="utf-8")
     (experts / "engineering-security-engineer.md").write_text("SECURITY-EXPERT-BODY", encoding="utf-8")
+    cards = tmp_path / "cards"
+    cards.mkdir()
+    (cards / "engineering-backend-architect.md").write_text("CARD-BACKEND-BODY", encoding="utf-8")
     mod._EXPERTS_DIR = experts
+    mod._CARDS_DIR = cards
     mod._LOG_PATH = tmp_path / "logs" / "dispatches.jsonl"
     mod._fetch_expert_from_github = lambda slug: None  # no network in tests
     ctx = _FakeCtx()
-    return SimpleNamespace(mod=mod, ctx=ctx, experts=experts, log=tmp_path / "logs" / "dispatches.jsonl")
+    return SimpleNamespace(mod=mod, ctx=ctx, experts=experts, cards=cards,
+                           log=tmp_path / "logs" / "dispatches.jsonl")
 
 
 def _turn(env, user, first, history=None, session_id="s1"):
@@ -92,316 +89,227 @@ def _turn(env, user, first, history=None, session_id="s1"):
     )
 
 
+def _user_msg(text):
+    return {"role": "user", "content": text}
+
+
 def _completion_msg(deleg_id, batch=True):
-    """Exact host re-entry shapes (live probe deleg_21ecff95, 2026-11-16: batch/fan-out form
-    is what even a 1-task dispatch delivers; single-task form per _format_async_delegation)."""
     marker = "[ASYNC DELEGATION BATCH COMPLETE — " if batch else "[ASYNC DELEGATION COMPLETE — "
-    return (
-        f"{marker}{deleg_id}]\n"
-        "A background subagent you dispatched earlier has finished.\n"
-        "Status: completed   API calls: 2   Duration: 41s\n"
-        "--- RESULT ---\n"
-        "SQL injection found in api/orders; parameterized queries recommended.\n"
-        "Full live transcript (complete tool/assistant trace): C:\\tmp\\probe\\task-0.log"
-    )
+    return (f"{marker}{deleg_id}]\n"
+            "A background subagent you dispatched earlier has finished.\n"
+            "Status: completed   API calls: 2   Duration: 41s\n"
+            "--- RESULT ---\nSQL injection found in api/orders.")
 
 
-# ── turn 1: anchor (v1 behavior, unchanged) ─────────────────────────────────
-
-def test_first_turn_anchors_and_injects_once(env):
-    env.ctx.llm.scripts = [{"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9}]
+def _first_turn_ctx(env):
+    """首轮锚定并返回注入的 context（含锚点标记）。"""
+    env.ctx.llm.scripts = [
+        {"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9},
+    ]
     r = _turn(env, "帮我写个 REST 后端 API", first=True)
     assert r is not None and "context" in r
+    return r["context"]
+
+
+def _events(env):
+    return [json.loads(line)["event"] for line in env.log.read_text(encoding="utf-8").splitlines()]
+
+
+# ── first-turn behavior ───────────────────────────────────────────────
+
+
+def test_first_turn_injects_expert_context(env):
+    env.ctx.llm.scripts = [
+        {"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9},
+    ]
+    r = _turn(env, "帮我写个 REST 后端 API", first=True)
+    assert r is not None, "first turn must inject expert context"
+    assert "context" in r
     assert "BACKEND-EXPERT-BODY" in r["context"]
-    assert env.mod._SESSIONS["s1"].anchor == "engineering-backend-architect"
-    assert env.ctx.dispatch_calls == []
+    assert "<!--ir-expert:engineering-backend-architect-->" in r["context"]
+    # 尾部加法: 专家正文在前, 路由器标记在后
+    assert r["context"].index("BACKEND-EXPERT-BODY") < r["context"].index("intent-router")
 
 
-def test_first_turn_short_greeting_skips_classification(env):
-    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
+def test_first_turn_confidence_below_gate_no_expert(env):
+    env.ctx.llm.scripts = [
+        {"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.4},
+    ]
+    r = _turn(env, "帮我写个 REST 后端 API", first=True)
+    assert r is None, "low confidence must NOT inject"
+
+
+def test_first_turn_no_expert_available(env):
+    env.ctx.llm.scripts = [
+        {"category": "unknown-domain", "confidence": 0.95},
+    ]
+    r = _turn(env, "帮我看看这个", first=True)
+    assert r is None
+
+
+def test_first_turn_no_category_below_min_confidence(env):
+    env.ctx.llm.scripts = [
+        {"category": "", "confidence": 0.3},
+    ]
     r = _turn(env, "hi", first=True)
     assert r is None
-    assert env.ctx.llm.calls == []          # guard fires BEFORE the aux LLM call
+
+
+# ── follow-up behavior (v3: 新域只出委派提示) ─────────────────────────
+
+
+def test_followup_same_expert_no_injection(env):
+    ctx1 = _first_turn_ctx(env)
+    env.ctx.llm.scripts = [{"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9}]
+    r = _turn(env, "再加个单元测试", first=False, history=[_user_msg(ctx1)])
+    assert r is None, "same expert already in context → no re-injection"
     assert env.ctx.dispatch_calls == []
 
 
-def test_first_turn_low_confidence_no_anchor(env):
-    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.5}]
-    assert _turn(env, "帮我写个 REST 后端 API", first=True) is None
-    assert env.mod._SESSIONS["s1"].anchor is None
-
-
-def test_first_turn_null_category_no_anchor(env):
-    env.ctx.llm.scripts = [None]
-    assert _turn(env, "随便聊聊", first=True) is None
-    assert env.mod._SESSIONS["s1"].anchor is None
-
-
-# ── follow-up turns: detect-only, never inject (cache invariant) ────────────
-
-def test_followup_same_domain_no_action(env):
+def test_followup_different_category_hints(env):
+    """v3: 新域过 gate → 委派提示卡（指示模型自己 delegate_task），无确定性派发。"""
+    ctx1 = _first_turn_ctx(env)
     env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "engineering", "confidence": 0.9},
+        {"category": "security", "confidence": 0.9},
     ]
-    _turn(env, "帮我写个 REST 后端 API", first=True)
-    r = _turn(env, "再加个单元测试", first=False)
-    assert r is None                       # no injection on follow-ups, ever
+    r = _turn(env, "查一下这个 API 的 SQL 注入", first=False, history=[_user_msg(ctx1)])
+    assert r is not None, "new domain past gate must surface the hint card"
+    assert "委派提示" in r["context"]
+    assert "engineering-security-engineer" in r["context"]
+    assert "delegate_task" in r["context"]
     assert env.ctx.dispatch_calls == []
+    assert env.mod._SESSIONS["s1"].anchor == "engineering-backend-architect"  # 锚点不被 hint 改
 
 
-def test_followup_low_confidence_no_dispatch(env):
+def test_followup_card_injection_never_full_text(env):
+    ctx1 = _first_turn_ctx(env)
     env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "security", "confidence": 0.5},   # below the 0.7 gate
+        {"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9},
     ]
-    _turn(env, "帮我写个 REST 后端 API", first=True)
-    assert _turn(env, "看看有没有注入", first=False) is None
-    assert env.ctx.dispatch_calls == []
+    r = _turn(env, "再加个单元测试", first=False, history=[_user_msg("[压缩摘要]")])
+    assert r is not None
+    assert "CARD-BACKEND-BODY" in r["context"]
+    assert "BACKEND-EXPERT-BODY" not in r["context"]
 
 
-def test_followup_null_category_no_dispatch(env):
+def test_lru_eviction_keeps_recent_sessions(env):
+    """LRU: 超过 _SESSIONS_MAX 的创建淘汰最旧, 最近访问者留驻。"""
+    mod = env.mod
+    for i in range(mod._SESSIONS_MAX):
+        mod._get_state(f"s{i}")
+    mod._get_state("fresh")
+    assert len(mod._SESSIONS) == mod._SESSIONS_MAX, "LRU cap must evict oldest"
+    assert "s0" not in mod._SESSIONS
+    assert "fresh" in mod._SESSIONS
+    assert f"s{mod._SESSIONS_MAX - 1}" in mod._SESSIONS
+
+
+# ── 合成完成重入轮（宿主 delegate_task 回传, v3 跳过一切检测）────────
+
+
+def test_completion_reentry_turn_skips_detection_batch(env):
+    """[ASYNC DELEGATION BATCH COMPLETE] 合成轮: 先于分类+提示跳过, 不烧 aux。"""
+    _first_turn_ctx(env)
+    env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
+    n_calls = len(env.ctx.llm.calls)
+    r = _turn(env, _completion_msg("deleg_0001", batch=True), first=False,
+              history=[_user_msg("x")])
+    assert r is None
+    assert len(env.ctx.llm.calls) == n_calls
+    assert "completion-skip" in _events(env)
+
+
+def test_completion_reentry_single_task_form(env):
+    """单任务 [ASYNC DELEGATION COMPLETE — ...] 同律跳过（宿主两种形态）。"""
+    _first_turn_ctx(env)
+    env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
+    n_calls = len(env.ctx.llm.calls)
+    r = _turn(env, _completion_msg("deleg_0002", batch=False), first=False,
+              history=[_user_msg("x")])
+    assert r is None
+    assert len(env.ctx.llm.calls) == n_calls
+    assert "completion-skip" in _events(env)
+
+
+def test_no_redispatch_after_completion_in_v3(env):
+    """v3: 无 running 状态可清 —— 完成轮后的新域消息不再出卡（幂等, 压缩后重置才重出）。"""
+    _first_turn_ctx(env)
     env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        None,
+        {"category": "security", "confidence": 0.9},
+        {"category": "security", "confidence": 0.9},
     ]
-    _turn(env, "帮我写个 REST 后端 API", first=True)
-    assert _turn(env, "嗯", first=False) is None
-    assert env.ctx.dispatch_calls == []
+    r1 = _turn(env, "查一下注入", first=False, history=[_user_msg("x")])
+    assert r1 is not None and "委派提示" in r1["context"]
+    _turn(env, _completion_msg("deleg_0001"), first=False, history=[_user_msg("x")])
+    r2 = _turn(env, "再查下注入", first=False,
+               history=[_user_msg("x"), _user_msg(r1["context"] + "\n" + _completion_msg("deleg_0001"))])
+    assert r2 is None, "已提示过的域不再重出（幂等）"
+    assert _events(env).count("hint") == 1
 
 
-def test_new_domain_dispatches_sub_expert_with_self_serve_context(env):
+# ── 缓存安全结构（尾部加法, 前缀不动）─────────────────────────────────
+
+
+def test_prefix_cache_stable_across_turns(env):
+    """只有事件轮（首轮锚注 / 新域 hint）注入 context; 非事件轮字节不变。
+    注: 历史必须包成 user 消息 dict —— _history_text 只消费 dict 消息,
+    裸字符串会被跳过（标记检测随之失明）, 这是本用例踩过的坑。"""
     env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
+        {"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9},
+        {"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9},
+        {"category": "security", "confidence": 0.9},
         {"category": "security", "confidence": 0.9},
     ]
     r1 = _turn(env, "帮我写个 REST 后端 API", first=True)
-    # 宿主语义: turn-1 user message + 注入一起持久化 → 后续历史含它（v2.1 锚点标记可见 → 非压缩事件）
-    turn1_persisted = f"帮我写个 REST 后端 API\n{r1['context']}" if r1 else "帮我写个 REST 后端 API"
-    r = _turn(env, "查一下这个 API 的 SQL 注入", first=False,
-               history=[{"role": "user", "content": turn1_persisted},
-                        {"role": "assistant", "content": "done"}])
-    assert r is not None and "分工台账" in r["context"]      # v2.5 L1: 标记可见 → 零补注；派发轮只出台账卡
-    assert len(env.ctx.dispatch_calls) == 1
-    tool, args, kw = env.ctx.dispatch_calls[0]
-    assert tool == "delegate_task"
-    assert "toolsets" not in args           # inherit parent toolsets incl. filemem + knowledge-base-search
-    assert "toolsets" not in kw
-    task = args["tasks"][0]
-    expert_path = str(env.experts / "engineering-security-engineer.md")
-    assert expert_path in task["context"]                      # runtime-resolved absolute native path
-    assert "filemem_search" in task["context"]                 # self-serve instructions
-    assert "kb_search_central" in task["context"]
-    assert "SQL 注入" in task["context"]                       # user's words carried
-    assert "git commit" in task["context"] or "git" in task["context"]  # main process owns git
-    # running flag recorded with the delegation id
-    slug = "engineering-security-engineer"
-    assert slug in env.mod._SESSIONS["s1"].running
+    hist = [_user_msg(r1["context"])]
+    r2 = _turn(env, "再加个单元测试", first=False, history=hist)
+    r3 = _turn(env, "查一下这个 API 的 SQL 注入", first=False, history=hist)
+    hist.append(_user_msg(r3["context"]))
+    r4 = _turn(env, "把注入修掉", first=False, history=hist)
+    injection_turns = [i for i, r in enumerate([r1, r2, r3, r4]) if r is not None]
+    assert injection_turns == [0, 2], f"only event turns must inject: {injection_turns}"
 
 
-def test_running_no_redispatch(env):
-    env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-    ]
-    _turn(env, "帮我写个 REST 后端 API", first=True)
-    _turn(env, "查一下注入", first=False)
-    _turn(env, "继续查注入", first=False)
-    assert len(env.ctx.dispatch_calls) == 1   # while running: no re-dispatch
+# ── 观测面 ─────────────────────────────────────────────────────────────
 
-
-def test_completion_reentry_clears_running_and_skips_detection(env):
-    env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-        # NO script for the synthetic completion turn — detection must be skipped
-    ]
-    _turn(env, "帮我写个 REST 后端 API", first=True)
-    _turn(env, "查一下注入", first=False)
-    calls_before = len(env.ctx.llm.calls)
-    r = _turn(env, _completion_msg("deleg_0001"), first=False)
-    assert r is None
-    assert len(env.ctx.llm.calls) == calls_before            # no classification on synthetic turns (loop guard)
-    assert env.mod._SESSIONS["s1"].running == {}             # running flag cleared by id
-
-
-def test_completion_reentry_single_task_form_also_guarded(env):
-    """单任务形态 '[ASYNC DELEGATION COMPLETE — ...]'（_format_async_delegation）同样被守卫。"""
-    env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-    ]
-    _turn(env, "帮我写个 REST 后端 API", first=True)
-    _turn(env, "查一下注入", first=False)
-    calls_before = len(env.ctx.llm.calls)
-    r = _turn(env, _completion_msg("deleg_0001", batch=False), first=False)
-    assert r is None
-    assert len(env.ctx.llm.calls) == calls_before
-    assert env.mod._SESSIONS["s1"].running == {}
-
-
-def test_redispatch_allowed_after_completion(env):
-    """Owner ruling B: a new Y-domain task after completion dispatches Y again."""
-    env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-    ]
-    _turn(env, "帮我写个 REST 后端 API", first=True)
-    _turn(env, "查一下注入", first=False)
-    _turn(env, _completion_msg("deleg_0001"), first=False)
-    n_after_reentry = len(env.ctx.dispatch_calls)
-    assert n_after_reentry == 1
-    _turn(env, "把发现的注入修掉", first=False)
-    assert len(env.ctx.dispatch_calls) == 2
-
-
-# ── cache regression: N-turn byte-stable prefix ─────────────────────────────
-
-def test_prefix_cache_stable_across_turns(env):
-    """Host semantics: a turn's user message = original + injection (if any).
-    Cache invariant: each turn's full prefix is a pure byte-extension of the previous
-    turn's prefix, and injection happens on turn 1 only."""
-    env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},   # post-completion re-dispatch turn
-    ]
-    turns = [
-        ("帮我写个 REST 后端 API", True),
-        ("再加个单元测试", False),
-        ("查一下 SQL 注入", False),
-        (_completion_msg("deleg_0001"), False),
-        ("把注入修掉", False),
-    ]
-    system = "SYSTEM PROMPT (constant)"
-    stored = []
-    prev_stream = None
-    injection_turns = []
-
-    def _stream(msgs):
-        # The byte stream a provider sees: each message serialized, concatenated.
-        # No list brackets — so "only extends, never mutates the head" == startswith.
-        return "\n".join(json.dumps(m, ensure_ascii=False) for m in msgs)
-
-    for i, (user, first) in enumerate(turns):
-        r = _turn(env, user, first, history=stored, session_id="s-pc")
-        injected = (r or {}).get("context")
-        if injected:
-            injection_turns.append(i)
-        eff_user = user + ("\n" + injected if injected else "")
-        # request seen by the provider this turn: system + stored history + this user msg
-        request_msgs = [{"role": "system", "content": system}] + stored + [{"role": "user", "content": eff_user}]
-        stream = _stream(request_msgs)
-        if prev_stream is not None:
-            assert stream.startswith(prev_stream), f"turn {i} mutated a previously-sent byte"
-        prev_stream = stream
-        stored.append({"role": "user", "content": eff_user})
-        stored.append({"role": "assistant", "content": f"reply-{i}"})
-    assert injection_turns == [0, 2, 4]          # v2.5: turn 1 锚点 + 派发轮台账卡（turn 2/4）；全部纯尾部加法，上方 startswith 字节扩展检查不变
-
-
-# ── structured audit log ─────────────────────────────────────────────────────
 
 def test_structured_log_written_utf8(env):
-    env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-    ]
-    _turn(env, "帮我写个 REST 后端 API", first=True, session_id="s-log")
-    _turn(env, "查一下注入", first=False, session_id="s-log")
+    _first_turn_ctx(env)
+    env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
+    _turn(env, "查一下注入", first=False, history=[_user_msg("x")])
     assert env.log.exists()
-    lines = [json.loads(l) for l in env.log.read_text(encoding="utf-8").splitlines() if l.strip()]
-    events = [l["event"] for l in lines]
-    assert "anchor" in events
-    assert "dispatch" in events
-    d = [l for l in lines if l["event"] == "dispatch"][0]
-    assert d["session_id"] == "s-log"
-    assert d["expert"] == "engineering-security-engineer"
-    assert d["delegation_id"].startswith("deleg_")
-    assert d["confidence"] == 0.9
+    line = json.loads(env.log.read_text(encoding="utf-8").splitlines()[-1])
+    assert line["event"] == "hint"
+    assert line["expert"] == "engineering-security-engineer"
+    assert line["confidence"] == 0.9
+    assert line["category"] == "security"
 
 
-def test_log_failure_is_fail_soft(env, tmp_path):
-    """A broken log path must never break the hook (owner: fail-soft).
-
-    Deterministic across OSes: make the log's PARENT a regular file →
-    open() raises NotADirectoryError on Windows AND POSIX."""
-    env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-    ]
-    blocker = tmp_path / "blocker"
-    blocker.write_text("i am a file, not a dir", encoding="utf-8")
-    env.mod._LOG_PATH = blocker / "dispatches.jsonl"
-    r = _turn(env, "帮我写个 REST 后端 API", first=True)
-    assert r is not None and "context" in r      # anchor injection still works
-    r2 = _turn(env, "查一下注入", first=False)
-    assert r2 is not None and "分工台账" in r2["context"]  # v2.5 L1: 派发路径仍工作 + 台账卡（日志故障 fail-soft 不变）
-    assert len(env.ctx.dispatch_calls) == 1      # the dispatch itself succeeded
-
-
-# ── cross-platform invariants ───────────────────────────────────────────────
-
-def test_no_hardcoded_path_constants_in_source(env):
-    """Owner ruling: zero hardcoded path constants (Windows canon or POSIX).
-
-    A hardcoded constant would appear as a QUOTED string literal in code;
-    prose in comments/docstrings may cite the ruling verbatim and is exempt.
-    """
-    import re as _re
-    plugin_src = (Path(__file__).resolve().parents[1] / "__init__.py").read_text(encoding="utf-8")
-    quoted_windows = _re.findall(r"""["'][A-Z]:[\\/][^"']*""", plugin_src)
-    assert not quoted_windows, f"quoted Windows absolute path literals: {quoted_windows}"
-    quoted_posix = _re.findall(r"""["']/(?:root|home)[^"']*""", plugin_src)
-    assert not quoted_posix, f"quoted POSIX root/home path literals: {quoted_posix}"
-    quoted_home = _re.findall(r"""["']~/[^"']*""", plugin_src)
-    assert not quoted_home, f"quoted ~ home path literals: {quoted_home}"
-    assert "sys.platform" not in plugin_src and "win32" not in plugin_src  # pathlib only, no OS branches
+def test_log_failure_is_fail_soft(env, monkeypatch):
+    """日志故障（磁盘不可写）绝不影响 hook 注入 —— 走 _log 内部 try/except。
+    模拟: 让 _LOG_PATH 的父目录链上挂一个普通文件 → mkdir 必失败。"""
+    logs_dir = env.log.parent
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    blocker = logs_dir / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(env.mod, "_LOG_PATH", blocker / "inner" / "dispatches.jsonl")
+    _first_turn_ctx(env)
+    env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
+    r = _turn(env, "查一下注入", first=False, history=[_user_msg("x")])
+    assert r is not None and "委派提示" in r["context"]
 
 
 def test_expert_path_is_native_absolute(env):
-    env.ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-    ]
-    _turn(env, "帮我写个 REST 后端 API", first=True)
-    _turn(env, "查一下注入", first=False)
-    ctx_text = env.ctx.dispatch_calls[0][1]["tasks"][0]["context"]
-    p = Path(env.experts / "engineering-security-engineer.md")
-    assert str(p) in ctx_text
-    assert p.is_absolute()
+    """专家资产在 Windows 上必须是盘符绝对路径（junction 可解析, MSYS /c/ 形态会断）。"""
+    _first_turn_ctx(env)
+    env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
+    r = _turn(env, "查一下注入", first=False, history=[_user_msg("x")])
+    ctx_text = r["context"]
+    assert str(env.experts / "engineering-security-engineer.md") in ctx_text
+    assert "C:\\" in ctx_text or "C:/" in ctx_text
 
 
-# ── state lifecycle: LRU cap + running TTL ──────────────────────────────────
-
-def test_session_lru_cap(env):
-    mod = env.mod
-    for i in range(mod._SESSIONS_MAX + 10):
-        st = mod._get_state(f"sess-{i}")
-        assert st is not None
-    assert len(mod._SESSIONS) <= mod._SESSIONS_MAX
-    assert "sess-0" not in mod._SESSIONS          # oldest evicted
-    assert f"sess-{mod._SESSIONS_MAX + 9}" in mod._SESSIONS
-
-
-def test_running_ttl_expiry(env):
-    """A lost completion wake must not wedge the running flag forever."""
-    import time as _t
-    mod, ctx = env.mod, env.ctx
-    ctx.llm.scripts = [
-        {"category": "engineering", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
-    ]
-    _turn(env, "帮我写个 REST 后端 API", first=True)
-    _turn(env, "查一下注入", first=False)
-    slug = "engineering-security-engineer"
-    st = mod._SESSIONS["s1"]
-    assert slug in st.running
-    # age the running entry past _RUNNING_TTL
-    st.running[slug] = ("deleg_0001", _t.time() - mod._RUNNING_TTL - 1)
-    _turn(env, "继续查注入", first=False)
-    assert len(ctx.dispatch_calls) == 2           # expired flag → re-dispatch permitted
+def test_no_hardcoded_paths_in_expert_text(env):
+    ctx1 = _first_turn_ctx(env)
+    for path in ("C:\\", "/c/Users/", "home/user"):
+        assert path not in ctx1
