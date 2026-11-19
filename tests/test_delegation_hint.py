@@ -349,6 +349,47 @@ def test_subagent_guard_still_short_circuits(env):
     assert not [e for e in _events(env) if e["event"] in ("anchor", "hint")]
 
 
+# ── pre_tool_call 委派专家绑定（v3.5, owner 裁决 2026-11-19: 替换 hint 卡面） ──
+
+def _tool_turn(env, tool_name, args, session_id="main-t", **kw):
+    """驱动 pre_tool_call hook: 宿主按 kwargs 传 tool_name/args/session_id。"""
+    hook = env.ctx.hooks.get("pre_tool_call")
+    assert hook is not None, "v3.5 必须注册 pre_tool_call hook"
+    return hook(tool_name=tool_name, args=args, session_id=session_id, **kw)
+
+
+def test_delegate_task_goal_gets_expert_bound(env):
+    """主 agent 手写纯 goal(delegate_task) → 插件强制把专家 slug+读文件指令绑进 goal/context。
+    根治'主 agent 不照抄 hint 卡'这次 d5d159 失效场景。"""
+    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
+    args = {"tasks": [{"goal": "对 filemem-dsh 做 100% 行为等价审计, 全绿才推进 P2",
+                       "context": ""}]}
+    r = _tool_turn(env, "delegate_task", args, session_id="db-1")
+    assert r is not None and r.get("action") == "modify"
+    new_tasks = r["args"]["tasks"]
+    assert "engineering-backend-architect" in new_tasks[0]["goal"]
+    assert "读专家文件" in new_tasks[0]["goal"] or "experts/" in new_tasks[0]["goal"]
+    assert "expert" in new_tasks[0]["context"].lower() or "专家绑定" in new_tasks[0]["context"]
+    assert [e for e in _events(env) if e["event"] == "delegate-bind"]
+
+
+def test_delegate_task_non_domain_goal_passthrough(env):
+    """goal 分类不出域(conf<gate) → 原样放行, 不硬塞专家, 无 delegate-bind 事件。"""
+    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.2}]
+    args = {"tasks": [{"goal": "随便查个小东西, 不涉及任何领域", "context": ""}]}
+    r = _tool_turn(env, "delegate_task", args, session_id="db-2")
+    assert r is None, "无域命中必须原样放行(None)"
+    assert not [e for e in _events(env) if e["event"] == "delegate-bind"]
+
+
+def test_pre_tool_call_ignores_other_tools(env):
+    """非 delegate_task 工具 → hook 直接 None, 零改写零事件。"""
+    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
+    r = _tool_turn(env, "terminal", {"command": "ls"}, session_id="db-3")
+    assert r is None
+    assert env.ctx.llm.calls == []   # 非 delegate_task 不烧分类
+
+
 # ── 前缀缓存不变量（提示卡 = 纯尾部加法） ────────────────────────────────
 
 def test_prefix_cache_stable_with_hint(env):
@@ -390,5 +431,6 @@ def test_prefix_cache_stable_with_hint(env):
 # ── 单 hook 面（post_llm_call 已退役） ─────────────────────────────────────
 
 def test_only_pre_hook_registered(env):
-    """v3 只注册 pre_llm_call（post 分序面随 launch_timing 退役）。"""
-    assert set(env.ctx.hooks.keys()) == {"pre_llm_call"}
+    """v3.5 注册 pre_llm_call(锚点/子agent注入/补注) + pre_tool_call(委派专家绑定);
+    post 分序面已随 launch_timing 退役。"""
+    assert set(env.ctx.hooks.keys()) == {"pre_llm_call", "pre_tool_call"}

@@ -670,9 +670,69 @@ def _manifest_version() -> str:
         return "?"
 
 
+# ── pre_tool_call 委派专家绑定（v3.5, owner 裁决 2026-11-19: 替换 hint 卡面） ──
+# 宿主 pre_tool_call 支持改写工具入参: 插件返回 {"action":"modify","args":{...}} → 宿主
+# _dispatch_pre_tool_call_hooks 合并 modified_args。拦 delegate_task 时, 对每个 task 的
+# goal 文本分类(复用 _classify), 命中≥gate → 强制把「作为 <category> 专家(<slug>) + 读
+# experts/<slug>.md」写进 goal 前缀 + context, 主 agent 手写纯 goal 也被补上专家绑定。
+# 审计: 改写记 delegate-bind 事件(每 session 节流)。fail-soft: 分类失败/无 slug → 原样放行。
+
+def _make_tool_hook(ctx: Any):
+    def _delegate_bind_hook(
+        tool_name: str,
+        args: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Optional[Dict[str, Any]]:
+        if tool_name != "delegate_task" or not isinstance(args, dict):
+            return None
+        tasks = args.get("tasks")
+        if not isinstance(tasks, list):
+            return None
+        session_id = str(kwargs.get("session_id") or "")
+        st = _get_state(session_id) if session_id else None
+        modified = False
+        new_tasks = []
+        for t in tasks:
+            if not isinstance(t, dict):
+                new_tasks.append(t)
+                continue
+            goal = str(t.get("goal") or "")
+            category, confidence = _classify(ctx, goal) if len(goal.strip()) >= 10 else (None, 0.0)
+            slug = CATEGORY_MAP.get(category) if (category and confidence >= _CONFIDENCE_GATE) else None
+            if not slug:
+                new_tasks.append(t)   # 分类不出域 → 原样放行(不硬塞专家)
+                continue
+            expert_path = _EXPERTS_DIR / f"{slug}.md"
+            goal_bind = (f"作为 {category} 领域专家（{slug}）: " + goal
+                         + f"。动手前先用 file 工具读专家文件 {expert_path} 获取该域规范。")
+            ctx_note = (f"专家绑定: {slug}（{category} 域, conf={confidence}）。"
+                        f"已强制读 {expert_path}; 只交付 findings, 不做 git commit/push。")
+            new_ctx = str(t.get("context") or "")
+            t2 = dict(t)
+            t2["goal"] = goal_bind
+            t2["context"] = (new_ctx + "\n" + ctx_note).strip()
+            new_tasks.append(t2)
+            modified = True
+        if modified and st is not None:
+            if not st.guard_logged:   # 复用节流位, 多 task/多轮不刷 jsonl
+                st.guard_logged = True
+            _log(session_id, "delegate-bind")
+            # 宿主浅合并: 只传被改的键(tasks), 其余顶层字段由宿主保留。
+            return {"action": "modify", "args": {"tasks": new_tasks}}
+        return None
+    return _delegate_bind_hook
+
+
 def register(ctx) -> None:
-    """插件注册入口（宿主加载时调用一次）。v3: 只注册 pre_llm_call（post 分序面
-    随 launch_timing 退役——无插件 spawn 即无需 post 时点）。"""
+    """插件注册入口（宿主加载时调用一次）。
+
+    v3.5: 委派专家绑定从 pre_llm_call 的 hint 卡面（模型驱动, 主 agent 可绕过）**替换**为
+    pre_tool_call 拦截 delegate_task（插件强制改写 goal/context 注入专家, 主 agent 绕不过）。
+    owner 裁决 2026-11-19: hint 卡 pre_llm_call 面"不工作、留着没用" → 退役, 改走宿主
+    支持的 pre_tool_call modified_args 通道（宿主 _dispatch_pre_tool_call_hooks 返回
+    (block_message, modified_args), 插件返回 {"action":"modify","args":{...}} 合并改写）。
+    """
     ctx.register_hook("pre_llm_call", _make_hook(ctx))
-    logger.info("intent-router v%s registered (anchor + delegation-hint (model-driven delegate_task) + card reinjection + /expert + anchor_inject + subagent-guard)",
+    ctx.register_hook("pre_tool_call", _make_tool_hook(ctx))
+    logger.info("intent-router v%s registered (anchor + delegation-bind-via-pre_tool_call (force-inject expert into delegate_task goal/context) + card reinjection + /expert + anchor_inject + subagent-inject)",
                 _manifest_version())
