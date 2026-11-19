@@ -56,9 +56,13 @@ class _FakeCtx:
         self.hooks = {}
         self._n = 0
         self.dispatch_result = None
+        self._config = {}   # subagent_inject 等开关; 测试按需 setdefault
 
     def register_hook(self, name, fn):
         self.hooks[name] = fn
+
+    def get_config(self, key, default=None):
+        return self._config.get(key, default)
 
     def dispatch_tool(self, tool_name, args, **kw):
         self.dispatch_calls.append((tool_name, args, kw))
@@ -183,3 +187,38 @@ def test_expert_command_still_works_on_main_session(env):
     r = _turn(env, "/expert security", first=False, session_id="main-2")
     assert isinstance(r, dict) and r.get("action") == "block"
     assert env.mod._SESSIONS["main-2"].anchor == "engineering-security-engineer"
+
+
+# ── subagent_inject 开关（v3.4, owner 裁决 2026-11-19: "两部分注入"②） ───────
+
+def test_subagent_inject_off_keeps_guard_default(env):
+    """subagent_inject 缺省（False）= 现状 P0 守卫全拦: 子 agent 零注入。
+    （_FakeCtx.get_config 返回默认 None→bool=False，等价宿主未配置。）"""
+    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
+    r = _turn(env, _GOAL, first=True, session_id="sub-off", platform="subagent")
+    assert r is None, "开关关时必须全拦"
+    assert [e for e in _events(env) if e["event"] == "subagent-guard"]
+
+
+def test_subagent_inject_on_injects_expert_by_task_domain(env):
+    """subagent_inject=true → 子 agent 不再短路, 按子任务域分类+注入专家全文。
+    命中记 subagent-inject（非 anchor, 非 subagent-guard）。"""
+    env.ctx._config["subagent_inject"] = True
+    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
+    r = _turn(env, _GOAL, first=True, session_id="sub-on", platform="subagent")
+    assert r is not None, "开关开时子 agent 应注入专家上下文"
+    assert "BACKEND-EXPERT-BODY" in r["context"]
+    assert env.ctx.llm.calls, "子 agent 开关开时允许烧 aux 分类"
+    evs = _events(env)
+    assert [e for e in evs if e["event"] == "subagent-inject"], evs
+    assert not [e for e in evs if e["event"] in ("subagent-guard", "anchor")], evs
+
+
+def test_subagent_inject_on_low_confidence_no_inject(env):
+    """subagent_inject=true 但分类 conf 低于 gate → 子 agent 也不注入（gate 守门不变）。"""
+    env.ctx._config["subagent_inject"] = True
+    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.3}]
+    r = _turn(env, _GOAL, first=True, session_id="sub-low", platform="subagent")
+    assert r is None
+    evs = _events(env)
+    assert not [e for e in evs if e["event"] in ("subagent-inject", "anchor")], evs

@@ -481,6 +481,18 @@ def _anchor_inject_enabled(ctx: Any) -> bool:
         return True   # 宿主无 get_config / 配置损坏 → 保守保持自动锚点
 
 
+# ── subagent_inject 配置开关（v3.4 新增, owner 裁决 2026-11-19: "两部分注入"②） ──
+# ② 按任务把专家注入到子 agent: 开启后, 子 agent（platform=subagent）的回合不再
+# 硬短路, 而是复用主 agent 首轮的「分类→命中≥gate→注入专家全文」流水线, 按
+# 子任务域动态注入。关闭（缺省）= 现状 P0 subagent-guard 全拦（零行为变化）。
+# 审计: 每次命中记 subagent-inject（子专家多 API-call 不刷 jsonl）。
+def _subagent_inject_enabled(ctx: Any) -> bool:
+    try:
+        return bool(ctx.get_config("subagent_inject", False))
+    except Exception:
+        return False   # 宿主无 get_config / 配置损坏 → 保守保持全拦（现状）
+
+
 # ── /expert 手动覆盖（v2.2 保留, owner 裁决 2026-11-17） ──────────────────
 # 宿主 veto 通道（{"action":"block"} → 该轮终止、不进推理、不烧分类）:
 #   /expert <category|slug>  切锚点（专家不在场 → 下一轮补全文；已在场 → 只切不注）
@@ -543,17 +555,20 @@ def _make_hook(ctx: Any):
         st = _get_state(session_id)
         msg = _normalize_user_message(user_message)
 
-        # 0) P0 平台守卫（v2.5.1 保留）: 子 agent session（模型 delegate_task 拉起的）
-        #    自己的回合不得进入路由流水线。宿主对每个 agent 回合无条件触发
-        #    pre_llm_call（只排除 detached fork）, kwargs 带 platform（子 agent =
-        #    "subagent"）+ parent_session_id —— 无守卫时默认 profile 会把错误专家
-        #    全文注入子 agent（persona 冲突）+ 烧 aux 分类。OR 语义: 任一信号即挡。
-        #    审计: 每 session 记一次 subagent-guard（多 API-call 子专家不刷 jsonl）。
-        if (kwargs.get("parent_session_id") or platform == "subagent"):
-            if not st.guard_logged:
-                st.guard_logged = True
-                _log(session_id, "subagent-guard")
-            return None
+        # 0) 子 agent session（platform=subagent / parent_session_id 非空）:
+        #    - subagent_inject=false（缺省）→ P0 守卫硬短路（现状: 零分类/零注入/零派发）,
+        #      每 session 记一次 subagent-guard。
+        #    - subagent_inject=true（v3.4, owner 裁决 2026-11-19）→ 不短路, 落到下方
+        #      is_first_turn 流水线索（分类→命中≥gate→注入专家全文）, 按子任务域动态
+        #      注入; 命中记 subagent-inject（审计节流, 多 API-call 不刷 jsonl）。
+        #    宿主对每个 agent 回合无条件触发 pre_llm_call（只排除 detached fork）。
+        _is_subagent = bool(kwargs.get("parent_session_id") or platform == "subagent")
+        if _is_subagent:
+            if not _subagent_inject_enabled(ctx):
+                if not st.guard_logged:
+                    st.guard_logged = True
+                    _log(session_id, "subagent-guard")
+                return None
 
         # 0.5) 循环守卫（v3 简化）: 宿主 [ASYNC DELEGATION] 合成完成轮 → 跳过检测
         #      （防 检测→提示→委派→重入→再检测 噪声环; v3 无 running 状态需清）
@@ -585,7 +600,14 @@ def _make_hook(ctx: Any):
                 logger.warning(f"Expert content not found for {slug}")
                 return None
             st.anchor = slug
-            _log(session_id, "anchor", category=category, expert=slug, confidence=confidence)
+            # 子 agent 开启 subagent_inject 命中 → 记 subagent-inject（审计节流）; 主 agent 记 anchor。
+            if _is_subagent:
+                if not st.guard_logged:   # 复用同一节流位, 防多 API-call 子专家刷 jsonl
+                    st.guard_logged = True
+                _log(session_id, "subagent-inject", category=category,
+                     expert=slug, confidence=confidence)
+            else:
+                _log(session_id, "anchor", category=category, expert=slug, confidence=confidence)
             return {"context": _wrap_injection(category, slug, content)}
 
         # ── 后续轮: 压缩补注（事件驱动）+ 新域检测 → 委派提示卡（v3 模型驱动） ──
