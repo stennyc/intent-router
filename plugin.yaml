@@ -12,3 +12,7 @@ config_schema:
     type: bool
     default: true
     description: 按任务把专家注入到子 agent 开关（② 动态配置专家）。true（缺省）时子 agent（platform=subagent）的回合复用首轮「分类→命中≥gate→注入专家全文」流水线，按子任务域动态注入（记 subagent-inject）；false 才保持 P0 subagent-guard 全拦（子 agent 零注入，靠 delegate_task.context 自读 experts/<slug>.md）。owner 2026-11-19 拍板缺省放行。
+  hint_inject:
+    type: bool
+    default: true
+    description: 「派发前选专家」面开关（hint 卡）。主 agent 后续轮检测到新域时发 hint 卡（goal 指定 slug + context 让子 agent 读 experts/<slug>.md）。true（缺省）保留 hint 卡；false 关 → 主 agent 不预设专家, 全权交给 subagent_inject（派发后子 agent 自分类）或主 agent 自答。owner 2026-11-19 用于实测"派发前选 vs 派发后自分类"哪个正常工作。

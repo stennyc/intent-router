@@ -128,6 +128,24 @@ def test_new_domain_injects_hint_card(env):
     assert len(hints) == 1 and hints[0]["expert"] == "engineering-security-engineer"
 
 
+def test_hint_inject_default_on_sends_card(env):
+    """hint_inject 缺省（无 get_config → True）= 保留 hint 卡面（现状）。"""
+    r, _h = _anchor_and_new_domain(env)
+    assert r is not None and "委派提示" in r["context"]
+
+
+def test_hint_inject_off_no_card(env):
+    """hint_inject=false（显式关）→ 主 agent 不预设专家, 不发 hint 卡。
+    供 owner 实测'派发前选 vs 派发后子 agent 自分类': 关 hint_inject 后专家全交给
+    subagent_inject（子 agent 自分类）或主 agent 自答。"""
+    env.ctx.settings["hint_inject"] = False
+    r, _h = _anchor_and_new_domain(env)
+    # 关后: 新域不再发 hint 卡（r 可能为 None 或 context 里无委派提示）
+    ctx_text = (r or {}).get("context", "")
+    assert "委派提示" not in ctx_text
+    assert not [e for e in _events(env) if e["event"] == "hint"]
+
+
 def test_hint_card_binding_not_advisory(env):
     """v3.3 绑定口吻: 卡指令模型采用模板, 旧弱化建议语（'仅为可选建议'）移除。
     v3.3.2 口吻升级为'复制粘贴'。"""

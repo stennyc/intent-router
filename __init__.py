@@ -493,6 +493,18 @@ def _subagent_inject_enabled(ctx: Any) -> bool:
         return True   # 宿主无 get_config / 配置损坏 → 缺省放行（子 agent 吃专家，owner 2026-11-19）
 
 
+# ── hint_inject 配置开关（v3.4.2 新增, owner 裁决 2026-11-19: 派发前选专家面） ──
+# 「① 主 agent 首轮 anchor_inject」与「② 派发后 subagent_inject」之外, 第三个面:
+# 「派发前选专家」= 主 agent 后续轮检测到新域 → 发 hint 卡（goal 里指定 slug + context
+# 让子 agent 读 experts/<slug>.md）, 主 agent 复制粘贴 delegate_task。本开关单独控此面,
+# 供 owner 实测「派发前选 vs 派发后子 agent 自分类」哪个正常工作。缺省 true（现状保留）。
+def _hint_inject_enabled(ctx: Any) -> bool:
+    try:
+        return bool(ctx.get_config("hint_inject", True))
+    except Exception:
+        return True   # 宿主无 get_config / 配置损坏 → 缺省保留 hint 卡面
+
+
 # ── /expert 手动覆盖（v2.2 保留, owner 裁决 2026-11-17） ──────────────────
 # 宿主 veto 通道（{"action":"block"} → 该轮终止、不进推理、不烧分类）:
 #   /expert <category|slug>  切锚点（专家不在场 → 下一轮补全文；已在场 → 只切不注）
@@ -623,7 +635,12 @@ def _make_hook(ctx: Any):
         if category is not None and confidence >= _CONFIDENCE_GATE:
             slug = CATEGORY_MAP.get(category)
         hint_ctx: Optional[str] = None
-        if slug is not None and slug != st.anchor:
+        # v3.4.2: 派发前选专家面（hint 卡）受 hint_inject 开关控制, 供 owner 实测。
+        # 关（hint_inject=false）→ 不发 hint 卡, 主 agent 不预设专家; 专家全权交给
+        # subagent_inject（派发后子 agent 自分类）或主 agent 自答。
+        if not _hint_inject_enabled(ctx):
+            pass   # 关: 跳过下方 hint 卡生成, hint_ctx 保持 None
+        elif slug is not None and slug != st.anchor:
             # 新域（≠ 锚点）过 gate → 委派提示卡: 每 session 每域一次（幂等）;
             # 压缩后标记丢失 → 再补一次（v2.1 卡补注同构, 卡便宜）
             if slug not in st.hinted:
