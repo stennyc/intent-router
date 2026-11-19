@@ -523,9 +523,14 @@ def _make_hook(ctx: Any):
             return expert_block
 
         if is_first_turn:
-            # v2.3: profile 配置 anchor_inject=false → 跳过首轮自动锚点（SOUL.md 已有
-            # 专家 persona；/expert 手动切换在上方命令分支，不受此开关影响）
-            if not _anchor_inject_enabled(ctx):
+            # v2.3: profile 配置 anchor_inject=false → 跳过【主 agent】首轮自动锚点
+            #（SOUL.md 已有专家 persona；/expert 手动切换在上方命令分支，不受此开关影响）
+            # v3.5.2 修: anchor_inject 只控主 agent 首轮锚点；子 agent 首轮注入归
+            # subagent_inject 管（上方 508 已判, subagent_inject=false 的早 return 了）,
+            # 不能被 anchor_inject=false 误拦（否则 subagent_inject=true 在
+            # anchor_inject=false 时形同虚设 —— deleg_cbcbf477 复现: 子 agent 7e08fb
+            # 分类命中 0.92 却被 528 拦, 零注入零审计）。
+            if not _is_subagent and not _anchor_inject_enabled(ctx):
                 _log(session_id, "anchor-disabled")
                 return None
             # ── v1 现况不变: 首轮问候守卫 + 分类 + 锚点注入（唯一注入点） ──

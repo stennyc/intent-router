@@ -234,6 +234,31 @@ def test_subagent_inject_on_injects_expert_by_task_domain(env):
     assert not [e for e in evs if e["event"] in ("subagent-guard", "anchor")], evs
 
 
+def test_subagent_inject_on_not_blocked_by_anchor_inject_off(env):
+    """v3.5.2 回归（deleg_cbcbf477 根因）: anchor_inject=false 只拦主 agent 首轮锚点,
+    不得误拦子 agent 的 subagent_inject 注入。
+    修前: 528 行 anchor_inject early-return 对子 agent 也生效 → subagent_inject=true 形同虚设
+    （子 agent 分类命中却被拦, 零注入零审计）。修后: not _is_subagent 前置, 子 agent 注入放行。"""
+    env.ctx._config["anchor_inject"] = False   # default profile 实盘配置
+    env.ctx._config["subagent_inject"] = True
+    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
+    r = _turn(env, _GOAL, first=True, session_id="sub-anchor-off", platform="subagent")
+    assert r is not None, "anchor_inject=false 不得拦子 agent 的 subagent_inject 注入"
+    assert "BACKEND-EXPERT-BODY" in r["context"]
+    evs = _events(env)
+    assert [e for e in evs if e["event"] == "subagent-inject"], evs
+    assert not [e for e in evs if e["event"] in ("anchor-disabled", "subagent-guard")], evs
+
+
+def test_anchor_inject_off_still_blocks_main_agent(env):
+    """v3.5.2 不变量: anchor_inject=false 仍拦【主 agent】首轮锚点（修 528 行不得误放主 agent）。"""
+    env.ctx._config["anchor_inject"] = False
+    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
+    r = _turn(env, _GOAL, first=True, session_id="main-anchor-off", platform="cli")
+    assert r is None, "主 agent anchor_inject=false 仍应跳过首轮锚点"
+    assert [e for e in _events(env) if e["event"] == "anchor-disabled"]
+
+
 def test_subagent_inject_on_low_confidence_no_inject(env):
     """subagent_inject=true 但分类 conf 低于 gate → 子 agent 也不注入（gate 守门不变）。"""
     env.ctx._config["subagent_inject"] = True

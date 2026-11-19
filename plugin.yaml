@@ -1,5 +1,5 @@
 name: intent-router
-version: "3.5.1"
+version: "3.5.2"
 description: "动态专家上下文路由 v3.5.1 — 锚点专家注入 + 委派专家通道（v3.5.1: 收敛为 subagent_inject 派发后子 agent 自分类注入专家；v3.5 的 pre_tool_call 强制改写 goal 经实测在 background/async delegation 传不到子 agent（白通道）已移除，hint 卡派发前面（冗余第三通道，实盘零触发）一并移除）+ 压缩后蒸馏卡补注 + 完成重入轮 completion-skip + /expert 手动覆盖 + 两注入面开关（anchor_inject 主agent首轮 / subagent_inject 派发后子agent自分类）+ P0 子 session 平台守卫（subagent-guard）"
 author: hermes-agent
 license: MIT
