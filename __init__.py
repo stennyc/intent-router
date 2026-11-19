@@ -422,10 +422,11 @@ def _anchor_inject_enabled(ctx: Any) -> bool:
 
 
 # ── subagent_inject 配置开关（v3.4 新增, owner 裁决 2026-11-19: "两部分注入"②） ──
-# ② 按任务把专家注入到子 agent: 开启后, 子 agent（platform=subagent）的回合不再
-# 硬短路, 而是复用主 agent 首轮的「分类→命中≥gate→注入专家全文」流水线, 按
-# 子任务域动态注入。关闭（缺省）= 现状 P0 subagent-guard 全拦（零行为变化）。
-# 审计: 每次命中记 subagent-inject（子专家多 API-call 不刷 jsonl）。
+# ② 按任务把专家注入到子 agent: 开启（缺省 true）后, 子 agent（platform=subagent）的
+# 回合不再硬短路, 而是复用首轮「分类→命中≥gate→注入专家全文」流水线, 按子任务域动态
+# 注入。关闭（subagent_inject=false）才 P0 subagent-guard 全拦（子 agent 零注入, 靠
+# delegate_task.context 自读 experts/<slug>.md）。owner 2026-11-19 拍板缺省放行。
+# 审计: 命中记 subagent-inject（同 session 节流, 多 API-call 不刷 jsonl）。
 def _subagent_inject_enabled(ctx: Any) -> bool:
     try:
         return bool(ctx.get_config("subagent_inject", True))
@@ -526,7 +527,7 @@ def _make_hook(ctx: Any):
             # v2.3: profile 配置 anchor_inject=false → 跳过【主 agent】首轮自动锚点
             #（SOUL.md 已有专家 persona；/expert 手动切换在上方命令分支，不受此开关影响）
             # v3.5.2 修: anchor_inject 只控主 agent 首轮锚点；子 agent 首轮注入归
-            # subagent_inject 管（上方 508 已判, subagent_inject=false 的早 return 了）,
+            # subagent_inject 管（上方 subagent_inject 判定处已处理: subagent_inject=false 早 return 了）,
             # 不能被 anchor_inject=false 误拦（否则 subagent_inject=true 在
             # anchor_inject=false 时形同虚设 —— deleg_cbcbf477 复现: 子 agent 7e08fb
             # 分类命中 0.92 却被 528 拦, 零注入零审计）。
