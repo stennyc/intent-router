@@ -116,14 +116,15 @@ def test_off_skips_first_turn_classification_and_injection(env):
     assert "anchor-disabled" in _events(env)
 
 
-def test_off_followup_no_anchor_hint_still_works(env):
-    """v3 无锚点模式: 新域后续只出委派提示（不派发）, 无补注（无锚点）。"""
+def test_off_followup_no_anchor_no_injection(env):
+    """v3.5.1 无锚点模式: 新域后续轮零注入（hint 卡面已删, 无补注（无锚点））,
+    无锚点状态面不变。"""
     env.ctx.settings = {"anchor_inject": False}
-    _turn(env, "帮我写个 REST 后端 API", first=True)    # 被跳过
+    _turn(env, "帮我写个 REST 后端 API", first=True)    # 被跳过（anchor-disabled）
     env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
     r = _turn(env, "查一下这个 API 的 SQL 注入", first=False, history=[_user_msg("x")])
     assert env.ctx.dispatch_calls == []
-    assert r is not None and "委派提示" in r["context"]
+    assert r is None, "无锚点 + 非压缩轮必须零注入（hint 卡面已删）"
     assert _sessions(env)["s1"].anchor is None
 
 

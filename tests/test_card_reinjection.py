@@ -185,13 +185,16 @@ def test_no_anchor_no_reinjection(env):
     env.ctx.llm.scripts = [
         {"category": "engineering", "confidence": 0.9},
         # 注意: 首轮 "随便聊聊"(4字<10) 被问候守卫拦下、不烧分类（脚本序列从
-        # 第二轮算起）→ 无锚点; 第二轮分类 engineering → 派发
+        # 第二轮算起）→ 无锚点; 第二轮分类 engineering（后续轮不再进 aux）
     ]
     assert _turn(env, "随便聊聊", first=True) is None
     r = _turn(env, "查一下注入", first=False, history=[_user_msg("[压缩摘要]")])
-    # v3: 无锚点 → 无补卡（测试意图不变, "card-reinject" 不得出现）; hint 轮出提示卡
-    assert r is not None and "委派提示" in r["context"]
-    assert "card-reinject" not in _events(env)
+    # v3.5.1: 无锚点 → 无补卡（测试意图不变, "card-reinject" 不得出现）;
+    # 无锚点 + 非压缩轮 → 零注入（hint 卡面已删, 不再出委派提示卡）
+    assert r is None, "无锚点必须零注入（无补卡, 无 hint 卡面）"
+    # 无 anchor + 无 card-reinject 事件 → 日志文件可能未创建（_log fail-soft）
+    if env.log.exists():
+        assert "card-reinject" not in _events(env)
 
 
 def test_empty_history_followup_never_reinjects(env):
@@ -203,25 +206,28 @@ def test_empty_history_followup_never_reinjects(env):
 
 
 def test_synthetic_completion_turn_never_reinjects(env):
-    """v3: 完成重入轮被 completion-skip 先行拦截 —— 即使历史缺标记也不补注 / 不重出 hint。"""
+    """v3.5.1: 完成重入轮被 completion-skip 先行拦截 —— 即使历史缺标记也不补注 /
+    不重出 hint（hint 卡面已删, hint 事件必须归零）。"""
     ctx1 = _first_turn_ctx(env)
     env.ctx.llm.scripts = [
         {"category": "security", "confidence": 0.9},
         {"category": "security", "confidence": 0.9},
     ]
     r1 = _turn(env, "查一下这个 API 的 SQL 注入", first=False, history=[_user_msg(ctx1)])
-    assert r1 is not None and "委派提示" in r1["context"]
+    # 常规轮（锚点标记在 ctx1）零注入（hint 卡面已删）
+    assert r1 is None
     assert env.ctx.dispatch_calls == []
     r = _turn(env, _completion_msg("deleg_0001"), first=False,
               history=[_user_msg("[压缩摘要]")])
     assert r is None
     assert "card-reinject" not in _events(env)
-    assert _events(env).count("hint") == 1, "完成轮不得重出 hint（幂等）"
+    assert "hint" not in _events(env), "hint 卡面已删: hint 事件必须归零"
     assert "completion-skip" in _events(env)
 
 
 def test_compression_and_hint_same_turn(env):
-    """v3: 压缩轮用户同时问新域 → 补卡 + 提示卡同轮完成（都是尾部加法, 宿主零派发副作用）。"""
+    """v3.5.1: 压缩轮（锚点标记缺失）触发压缩补注（活逻辑）; hint 卡面已删 →
+    同轮不再叠加委派提示卡（hint 事件归零）。"""
     ctx1 = _first_turn_ctx(env)
     env.ctx.llm.scripts = [
         {"category": "security", "confidence": 0.9},
@@ -230,8 +236,9 @@ def test_compression_and_hint_same_turn(env):
                history=[_user_msg("[压缩摘要]")])
     assert env.ctx.dispatch_calls == []
     assert r is not None and "CARD-BACKEND-BODY" in r["context"]
-    assert "委派提示" in r["context"]
+    assert "委派提示" not in r["context"], "hint 卡面已删: 同轮不得叠加委派提示卡"
     assert "card-reinject" in _events(env)
+    assert "hint" not in _events(env)
 
 
 def test_reinjection_does_not_mutate_history(env):

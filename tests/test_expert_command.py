@@ -168,7 +168,8 @@ def test_expert_clear_resets_anchor(env):
     assert _sessions(env)["s1"].anchor is None
     env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
     r2 = _turn(env, "再加个单元测试", first=False, history=[_user_msg("y")])
-    assert r2 is not None and "委派提示" in r2["context"]   # v3: 无锚点 → 无补注（意图不变）; hint 轮出提示卡
+    # v3.5.1: 无锚点 → 无压缩补注（无锚点标记可检测）; hint 卡面已删 → 常规轮零注入
+    assert r2 is None, f"无锚点 + 非压缩轮必须零注入, got: {r2}"
 
 
 def test_expert_invalid_no_state_change(env):
@@ -189,15 +190,17 @@ def test_expert_on_first_turn(env):
 # ── 与派发/重入的交互 ─────────────────────────────────────────────────────
 
 def test_expert_switch_after_hint_and_completion_skip(env):
-    """v3: security 出过提示后切锚点到 product: 完成重入轮仍被跳过, 提示状态不受影响。"""
+    """v3.5.1: security 分类过 gate 后（hint 卡面已删, 无 hint 状态面）切锚点到 product:
+    完成重入轮仍被循环守卫跳过（活逻辑: completion-skip + 不烧 aux 分类）。"""
     env.ctx.llm.scripts = [
         {"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9},
         {"category": "security", "confidence": 0.9},
-        {"category": "security", "confidence": 0.9},
+        None,
     ]
     _turn(env, "帮我写个 REST 后端 API", first=True)
     _turn(env, "查一下注入", first=False, history=[_user_msg("x")])
-    assert "engineering-security-engineer" in _sessions(env)["s1"].hinted   # 提示态不变
+    assert "engineering-security-engineer" in _sessions(env)["s1"].anchor or \
+           _sessions(env)["s1"].anchor == "engineering-backend-architect"  # 锚点不被后续轮改
     r = _turn(env, "/expert product", first=False, history=[_user_msg("x")])
     assert r["action"] == "block"
     assert _sessions(env)["s1"].anchor == "product-manager"

@@ -141,8 +141,6 @@ _CARDS_DIR = Path(__file__).resolve().parent / "cards"
 # 这两个 HTML 注释。历史里任一标记在 = "专家可见"；双缺失 + 历史非空 = 压缩事件。
 _ANCHOR_MARKER_FMT = "<!--ir-expert:{}-->"
 _CARD_MARKER_FMT = "<!--ir-card:{}-->"
-# v3: 委派提示卡标记（压缩后 hint 再补检测, 与卡补注同构）
-_HINT_MARKER_FMT = "<!--ir-hint:{}-->"
 
 _CONFIDENCE_GATE = 0.7    # v1 阈值，不变
 # G1（v2.7 保留）: 后续轮短消息护栏——单/双字插话（"修"/"推"/"继续"）无领域
@@ -165,7 +163,7 @@ _COMPLETION_ID_RE = re.compile(r"\[ASYNC DELEGATION (?:BATCH )?COMPLETE[^\]]*?([
 
 
 class _SessionState:
-    __slots__ = ("anchor", "last_seen", "full_on_next", "guard_logged", "hinted")
+    __slots__ = ("anchor", "last_seen", "full_on_next", "guard_logged")
 
     def __init__(self) -> None:
         self.anchor: Optional[str] = None
@@ -174,8 +172,6 @@ class _SessionState:
         self.full_on_next: bool = False
         # v2.5.1 P0: subagent-guard 审计节流（每 session 记一次, 防多 API-call 子专家刷 jsonl）
         self.guard_logged: bool = False
-        # v3: 已出过委派提示卡的域（每 session 每域一次; 压缩后标记丢失可再补）
-        self.hinted: set = set()
 
 
 _SESSIONS: "OrderedDict[str, _SessionState]" = OrderedDict()
@@ -303,18 +299,7 @@ def _normalize_user_message(user_message: Any) -> str:
     return str(user_message or "")
 
 
-def _join_ctx(*pieces: Optional[str]) -> Optional[str]:
-    """合并注入片（append-only，保持字节序稳定：压缩补注在前、委派提示卡最后）。"""
-    out = "\n\n".join(p for p in pieces if p)
-    return out or None
-
-
 # ── 委派提示卡（v3.0, owner 裁决 2026-11-18: 委派判断归模型, 插件只给指示） ─
-
-def _task_label(user_message: str, cap: int = 80) -> str:
-    """提示卡 goal 模板用的单行任务标签（用户原话截断）。"""
-    return " ".join(str(user_message or "").split())[:cap]
-
 
 def _history_text(conversation_history: Any) -> str:
     """拼接各消息 content（str 或 content-parts list）。只读，fail-soft。"""
@@ -331,51 +316,6 @@ def _history_text(conversation_history: Any) -> str:
         return "\n".join(parts)
     except Exception:
         return ""
-
-
-def _hint_visible(st: _SessionState, conversation_history: Any) -> bool:
-    """v3: 委派提示卡标记是否仍在当前历史里（压缩丢失检测, 与 v2.1 卡补注同构）。"""
-    if not st.hinted:
-        return True
-    blob = _history_text(conversation_history)
-    return any(_HINT_MARKER_FMT.format(slug) in blob for slug in st.hinted)
-
-
-def _hint_card(slug: str, category: str, confidence: float, user_message: str) -> str:
-    """v3.3 绑定式委派提示卡 + v3.3.2 强化（复制粘贴口吻 + ```json 围栏 + goal/context 局部变量提取）:
-    - v3.3 口吻: 绑定式, 原样采用 goal/context 两字段, 勿改写/勿删减
-    - v3.3.1: 指令句前移 + 数据块显式参数化为 delegate_task(tasks=[{...}]) 帧
-    - v3.3.2（本次）:
-      * 口吻从「请原样采用」升为「**复制粘贴**下面调用体（勿改写任何字段）」——降低 LLM 自写概率
-      * 数据块加 ```json 围栏——fenced code block 照抄率高于裸文本
-      * goal/context 提取为函数内局部变量 goal_text / context_text——代码可读性, 行为不变
-    - 调度纪律: 一次只委派一个任务, 勿创建占位/备用/no-op 子 agent
-    - goal 明写 F3 边界: 勿重做主进程已在做的工作
-    append-only 尾部加法, 缓存安全。"""
-    expert_path = _EXPERTS_DIR / f"{slug}.md"
-    task = _task_label(user_message)
-    goal_text = (f"作为 {category} 领域专家（{slug}）执行以下任务: {task}。"
-                 f"只交付 findings/结果, 勿重做主进程已在做的工作")
-    context_text = (f"1) 先读专家文件 {expert_path}（file 工具; 若文件不存在则在结果中说明, "
-                    f"勿从网络拉取）; 2) 动手前自取持久上下文: 用 filemem_search 与 kb_search_central "
-                    f"查与本任务相关的 {category} 域事实; 3) 只交付 findings, 不做 git commit/push"
-                    f"（git 归主进程）")
-    return (
-        f"## 委派提示（新域: {category}）\n"
-        f"检测到新领域 {category}（专家 slug={slug}, conf={confidence}）。\n"
-        f"纪律: 一次只委派一个任务——勿创建占位/备用/no-op 子 agent。\n"
-        f"结果由宿主自动重入（无需轮询）; 不委派则主进程直接自答亦可。\n"
-        f"如委派, **复制粘贴**下面调用体（勿改写任何字段）:\n"
-        f"```json\n"
-        f"delegate_task(tasks=[\n"
-        f"  {{\n"
-        f'    "goal": "{goal_text}",\n'
-        f'    "context": "{context_text}"\n'
-        f"  }}\n"
-        f"])\n"
-        f"```\n"
-        f"{_HINT_MARKER_FMT.format(slug)}"
-    )
 
 
 def _completion_skip(user_message: str, st: _SessionState, session_id: str) -> bool:
@@ -493,16 +433,6 @@ def _subagent_inject_enabled(ctx: Any) -> bool:
         return True   # 宿主无 get_config / 配置损坏 → 缺省放行（子 agent 吃专家，owner 2026-11-19）
 
 
-# ── hint_inject 配置开关（v3.4.2 新增, owner 裁决 2026-11-19: 派发前选专家面） ──
-# 「① 主 agent 首轮 anchor_inject」与「② 派发后 subagent_inject」之外, 第三个面:
-# 「派发前选专家」= 主 agent 后续轮检测到新域 → 发 hint 卡（goal 里指定 slug + context
-# 让子 agent 读 experts/<slug>.md）, 主 agent 复制粘贴 delegate_task。本开关单独控此面,
-# 供 owner 实测「派发前选 vs 派发后子 agent 自分类」哪个正常工作。缺省 true（现状保留）。
-def _hint_inject_enabled(ctx: Any) -> bool:
-    try:
-        return bool(ctx.get_config("hint_inject", True))
-    except Exception:
-        return True   # 宿主无 get_config / 配置损坏 → 缺省保留 hint 卡面
 
 
 # ── /expert 手动覆盖（v2.2 保留, owner 裁决 2026-11-17） ──────────────────
@@ -622,37 +552,9 @@ def _make_hook(ctx: Any):
                 _log(session_id, "anchor", category=category, expert=slug, confidence=confidence)
             return {"context": _wrap_injection(category, slug, content)}
 
-        # ── 后续轮: 压缩补注（事件驱动）+ 新域检测 → 委派提示卡（v3 模型驱动） ──
+        # ── 后续轮: 压缩补注（事件驱动） ──
         reinject_ctx = _reinject_after_compaction(st, session_id, conversation_history)
-        # G1 短消息护栏（v3.2 起唯一静默门: 纯长度判断, 语言无关）: 单/双字插话
-        # 无新域任务信号 → 跳过 aux（零事件）。问句不再特殊化（v2.9 regex 退役,
-        # owner 裁决 2026-11-18 全球化）—— 与普通消息同律过 aux + conf gate。
-        if len(msg.strip()) < _MIN_SUBSEQ_LEN:
-            category, confidence = None, 0.0
-        else:
-            category, confidence = _classify(ctx, msg)
-        slug = None
-        if category is not None and confidence >= _CONFIDENCE_GATE:
-            slug = CATEGORY_MAP.get(category)
-        hint_ctx: Optional[str] = None
-        # v3.4.2: 派发前选专家面（hint 卡）受 hint_inject 开关控制, 供 owner 实测。
-        # 关（hint_inject=false）→ 不发 hint 卡, 主 agent 不预设专家; 专家全权交给
-        # subagent_inject（派发后子 agent 自分类）或主 agent 自答。
-        if not _hint_inject_enabled(ctx):
-            pass   # 关: 跳过下方 hint 卡生成, hint_ctx 保持 None
-        elif slug is not None and slug != st.anchor:
-            # 新域（≠ 锚点）过 gate → 委派提示卡: 每 session 每域一次（幂等）;
-            # 压缩后标记丢失 → 再补一次（v2.1 卡补注同构, 卡便宜）
-            if slug not in st.hinted:
-                st.hinted.add(slug)
-                _log(session_id, "hint", category=category, expert=slug,
-                     confidence=confidence)
-                hint_ctx = _hint_card(slug, category, confidence, msg)
-            elif not _hint_visible(st, conversation_history):
-                _log(session_id, "hint", category=category, expert=slug,
-                     confidence=confidence, note="compaction-rehint")
-                hint_ctx = _hint_card(slug, category, confidence, msg)
-        ctx_out = _join_ctx(reinject_ctx, hint_ctx)
+        ctx_out = reinject_ctx
         return {"context": ctx_out} if ctx_out else None
 
     return _intent_router_hook
@@ -670,69 +572,15 @@ def _manifest_version() -> str:
         return "?"
 
 
-# ── pre_tool_call 委派专家绑定（v3.5, owner 裁决 2026-11-19: 替换 hint 卡面） ──
-# 宿主 pre_tool_call 支持改写工具入参: 插件返回 {"action":"modify","args":{...}} → 宿主
-# _dispatch_pre_tool_call_hooks 合并 modified_args。拦 delegate_task 时, 对每个 task 的
-# goal 文本分类(复用 _classify), 命中≥gate → 强制把「作为 <category> 专家(<slug>) + 读
-# experts/<slug>.md」写进 goal 前缀 + context, 主 agent 手写纯 goal 也被补上专家绑定。
-# 审计: 改写记 delegate-bind 事件(每 session 节流)。fail-soft: 分类失败/无 slug → 原样放行。
-
-def _make_tool_hook(ctx: Any):
-    def _delegate_bind_hook(
-        tool_name: str,
-        args: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> Optional[Dict[str, Any]]:
-        if tool_name != "delegate_task" or not isinstance(args, dict):
-            return None
-        tasks = args.get("tasks")
-        if not isinstance(tasks, list):
-            return None
-        session_id = str(kwargs.get("session_id") or "")
-        st = _get_state(session_id) if session_id else None
-        modified = False
-        new_tasks = []
-        for t in tasks:
-            if not isinstance(t, dict):
-                new_tasks.append(t)
-                continue
-            goal = str(t.get("goal") or "")
-            category, confidence = _classify(ctx, goal) if len(goal.strip()) >= 10 else (None, 0.0)
-            slug = CATEGORY_MAP.get(category) if (category and confidence >= _CONFIDENCE_GATE) else None
-            if not slug:
-                new_tasks.append(t)   # 分类不出域 → 原样放行(不硬塞专家)
-                continue
-            expert_path = _EXPERTS_DIR / f"{slug}.md"
-            goal_bind = (f"作为 {category} 领域专家（{slug}）: " + goal
-                         + f"。动手前先用 file 工具读专家文件 {expert_path} 获取该域规范。")
-            ctx_note = (f"专家绑定: {slug}（{category} 域, conf={confidence}）。"
-                        f"已强制读 {expert_path}; 只交付 findings, 不做 git commit/push。")
-            new_ctx = str(t.get("context") or "")
-            t2 = dict(t)
-            t2["goal"] = goal_bind
-            t2["context"] = (new_ctx + "\n" + ctx_note).strip()
-            new_tasks.append(t2)
-            modified = True
-        if modified and st is not None:
-            if not st.guard_logged:   # 复用节流位, 多 task/多轮不刷 jsonl
-                st.guard_logged = True
-            _log(session_id, "delegate-bind")
-            # 宿主浅合并: 只传被改的键(tasks), 其余顶层字段由宿主保留。
-            return {"action": "modify", "args": {"tasks": new_tasks}}
-        return None
-    return _delegate_bind_hook
-
-
 def register(ctx) -> None:
     """插件注册入口（宿主加载时调用一次）。
 
-    v3.5: 委派专家绑定从 pre_llm_call 的 hint 卡面（模型驱动, 主 agent 可绕过）**替换**为
-    pre_tool_call 拦截 delegate_task（插件强制改写 goal/context 注入专家, 主 agent 绕不过）。
-    owner 裁决 2026-11-19: hint 卡 pre_llm_call 面"不工作、留着没用" → 退役, 改走宿主
-    支持的 pre_tool_call modified_args 通道（宿主 _dispatch_pre_tool_call_hooks 返回
-    (block_message, modified_args), 插件返回 {"action":"modify","args":{...}} 合并改写）。
+    v3.5.1: 委派专家通道收敛为 subagent_inject（派发后子 agent 自分类注入专家）——
+    实测（deleg_6ef27712）确认 pre_tool_call 强制改写 goal 在 background/async
+    delegation 路径传不到子 agent（白通道）, 已移除; hint 卡派发前面（冗余第三通道,
+    实盘零触发）一并移除。保留: anchor 首轮注入 + 压缩补注（reinject）+ subagent_inject
+    + /expert 手动覆盖 + subagent-guard P0 守卫。
     """
     ctx.register_hook("pre_llm_call", _make_hook(ctx))
-    ctx.register_hook("pre_tool_call", _make_tool_hook(ctx))
-    logger.info("intent-router v%s registered (anchor + delegation-bind-via-pre_tool_call (force-inject expert into delegate_task goal/context) + card reinjection + /expert + anchor_inject + subagent-inject)",
+    logger.info("intent-router v%s registered (anchor + card reinjection + /expert + anchor_inject + subagent-inject + subagent-guard)",
                 _manifest_version())

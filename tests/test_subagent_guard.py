@@ -173,17 +173,20 @@ def test_subagent_inject_off_no_injection(env):
 # ── 主 session 零回归 ───────────────────────────────────────────────────────
 
 def test_main_session_pipeline_unaffected(env):
-    """主 session（无 parent, 非 subagent platform）全流水线照旧: 锚点 + 委派提示（v3）。"""
+    """v3.5.1: 主 session（无 parent, 非 subagent platform）流水线照旧: 首轮锚点注入;
+    后续常规轮（锚点标记可见）零注入（hint 卡面已删, 唯一注入面 = 压缩补注）。"""
     env.ctx.llm.scripts = [
         {"category": "engineering", "confidence": 0.9},
         {"category": "security", "confidence": 0.9},
     ]
     r1 = _turn(env, "帮我写个 REST 后端 API", first=True, session_id="main-1")
     assert r1 is not None and "BACKEND-EXPERT-BODY" in r1["context"]
-    r2 = _turn(env, "做个安全审查", first=False, session_id="main-1")
-    h = [e for e in _events(env) if e["event"] == "hint"]
-    assert h, "主 session hint 面不得被守卫误伤"
-    assert not [e for e in _events(env) if e["event"] == "subagent-guard"], "主 session 不得记 guard 事件"
+    # 锚点标记在历史 → 常规轮零注入（hint 卡面已删）
+    r2 = _turn(env, "做个安全审查", first=False, session_id="main-1",
+               history=[{"role": "user", "content": f"帮我写个 REST 后端 API\n{r1['context']}"}])
+    assert r2 is None, "常规轮（锚点标记可见）必须零注入"
+    assert not [e for e in _events(env) if e["event"] == "subagent-guard"], \
+        "主 session 不得记 guard 事件"
 
 
 def test_expert_command_still_works_on_main_session(env):

@@ -166,19 +166,17 @@ def test_followup_same_expert_no_injection(env):
     assert env.ctx.dispatch_calls == []
 
 
-def test_followup_different_category_hints(env):
-    """v3: 新域过 gate → 委派提示卡（指示模型自己 delegate_task），无确定性派发。"""
+def test_followup_different_category_no_injection(env):
+    """v3.5.1: 新域过 gate 不再出 hint 卡（hint 卡面已删）—— 锚点标记仍可见的
+    常规后续轮零注入; 锚点不被后续轮改写。"""
     ctx1 = _first_turn_ctx(env)
     env.ctx.llm.scripts = [
         {"category": "security", "confidence": 0.9},
     ]
     r = _turn(env, "查一下这个 API 的 SQL 注入", first=False, history=[_user_msg(ctx1)])
-    assert r is not None, "new domain past gate must surface the hint card"
-    assert "委派提示" in r["context"]
-    assert "engineering-security-engineer" in r["context"]
-    assert "delegate_task" in r["context"]
+    assert r is None, "hint 卡面已删: 常规后续轮（锚点标记可见）必须零注入"
     assert env.ctx.dispatch_calls == []
-    assert env.mod._SESSIONS["s1"].anchor == "engineering-backend-architect"  # 锚点不被 hint 改
+    assert env.mod._SESSIONS["s1"].anchor == "engineering-backend-architect"  # 锚点不被改
 
 
 def test_followup_card_injection_never_full_text(env):
@@ -232,26 +230,26 @@ def test_completion_reentry_single_task_form(env):
 
 
 def test_no_redispatch_after_completion_in_v3(env):
-    """v3: 无 running 状态可清 —— 完成轮后的新域消息不再出卡（幂等, 压缩后重置才重出）。"""
+    """v3.5.1: 完成轮后新域消息不再出 hint 卡（hint 卡面已删; 锚点标记可见 → 零注入）。
+    完成轮本身被 completion-skip 循环守卫拦截。"""
     _first_turn_ctx(env)
     env.ctx.llm.scripts = [
         {"category": "security", "confidence": 0.9},
         {"category": "security", "confidence": 0.9},
     ]
     r1 = _turn(env, "查一下注入", first=False, history=[_user_msg("x")])
-    assert r1 is not None and "委派提示" in r1["context"]
+    # 压缩补注（活逻辑）给卡/全文, 但 hint 事件必须归零
+    assert "hint" not in _events(env)
     _turn(env, _completion_msg("deleg_0001"), first=False, history=[_user_msg("x")])
-    r2 = _turn(env, "再查下注入", first=False,
-               history=[_user_msg("x"), _user_msg(r1["context"] + "\n" + _completion_msg("deleg_0001"))])
-    assert r2 is None, "已提示过的域不再重出（幂等）"
-    assert _events(env).count("hint") == 1
+    assert "completion-skip" in _events(env)
 
 
 # ── 缓存安全结构（尾部加法, 前缀不动）─────────────────────────────────
 
 
 def test_prefix_cache_stable_across_turns(env):
-    """只有事件轮（首轮锚注 / 新域 hint）注入 context; 非事件轮字节不变。
+    """v3.5.1: 只有事件轮（首轮锚注 / 压缩补注轮）注入 context; 常规轮字节不变。
+    hint 卡面已删 → 新域常规轮（锚点标记可见）零注入, 不污染前缀。
     注: 历史必须包成 user 消息 dict —— _history_text 只消费 dict 消息,
     裸字符串会被跳过（标记检测随之失明）, 这是本用例踩过的坑。"""
     env.ctx.llm.scripts = [
@@ -264,56 +262,88 @@ def test_prefix_cache_stable_across_turns(env):
     hist = [_user_msg(r1["context"])]
     r2 = _turn(env, "再加个单元测试", first=False, history=hist)
     r3 = _turn(env, "查一下这个 API 的 SQL 注入", first=False, history=hist)
-    hist.append(_user_msg(r3["context"]))
+    # 常规后续轮（锚点标记在 hist）: r2/r3 必须零注入 → 不 append 进 hist
+    assert r2 is None, "常规轮必须零注入"
+    assert r3 is None, "hint 卡面已删: 新域常规轮零注入"
     r4 = _turn(env, "把注入修掉", first=False, history=hist)
+    assert r4 is None, "无压缩事件 → 零注入"
     injection_turns = [i for i, r in enumerate([r1, r2, r3, r4]) if r is not None]
-    assert injection_turns == [0, 2], f"only event turns must inject: {injection_turns}"
+    assert injection_turns == [0], f"only event turns must inject: {injection_turns}"
+
+
+def test_prefix_cache_stable_with_compression_reinject(env):
+    """v3.5.1: 压缩补注（活逻辑）是常规轮唯一注入面 —— 标记缺失轮注入卡/全文,
+    常规轮字节不变（前缀缓存安全）。"""
+    env.ctx.llm.scripts = [
+        {"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9},
+        {"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9},
+        {"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9},
+    ]
+    r1 = _turn(env, "帮我写个 REST 后端 API", first=True)
+    # turn1: 锚点标记消失（[压缩摘要]）→ 压缩补注轮
+    r2 = _turn(env, "查一下注入", first=False, history=[_user_msg("[压缩摘要]")])
+    assert r2 is not None, "压缩补注轮必须注入（卡或全文）"
+    # 补注后标记回历史 → 常规轮零注入
+    hist = [_user_msg("[压缩摘要]"), _user_msg(r2["context"])]
+    r3 = _turn(env, "继续查", first=False, history=hist)
+    assert r3 is None, "标记可见后常规轮必须零注入"
 
 
 # ── 观测面 ─────────────────────────────────────────────────────────────
 
 
 def test_structured_log_written_utf8(env):
-    _first_turn_ctx(env)
+    """_log 仍活（anchor / card-reinject / completion-skip 等事件走 _log）;
+    断言 _log UTF-8 写入能力（不依赖已删的 hint 事件）。"""
+    ctx1 = _first_turn_ctx(env)
     env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
-    _turn(env, "查一下注入", first=False, history=[_user_msg("x")])
+    _turn(env, "查一下这个 API 的 SQL 注入", first=False, history=[_user_msg("[压缩摘要]")])
     assert env.log.exists()
-    line = json.loads(env.log.read_text(encoding="utf-8").splitlines()[-1])
-    assert line["event"] == "hint"
-    assert line["expert"] == "engineering-security-engineer"
-    assert line["confidence"] == 0.9
-    assert line["category"] == "security"
+    lines = [json.loads(line) for line in env.log.read_text(encoding="utf-8").splitlines()]
+    assert lines, "至少应有 anchor + card-reinject 事件"
+    # 首个事件必须是 anchor（_log UTF-8 写入验证面）
+    assert lines[0]["event"] == "anchor"
+    assert lines[0]["expert"] == "engineering-backend-architect"
+    assert lines[0]["confidence"] == 0.9
+    assert lines[0]["category"] == "engineering"
 
 
 def test_log_failure_is_fail_soft(env, monkeypatch):
-    """日志故障（磁盘不可写）绝不影响 hook 注入 —— 走 _log 内部 try/except。
-    模拟: 让 _LOG_PATH 的父目录链上挂一个普通文件 → mkdir 必失败。"""
+    """_log fail-soft: 日志路径不可写（父目录链挂普通文件 → mkdir 必失败）
+    绝不影响 hook 注入 —— 走 _log 内部 try/except。用 anchor 事件验证（_log 仍活）。"""
     logs_dir = env.log.parent
     logs_dir.mkdir(parents=True, exist_ok=True)
     blocker = logs_dir / "blocker"
     blocker.write_text("x", encoding="utf-8")
     monkeypatch.setattr(env.mod, "_LOG_PATH", blocker / "inner" / "dispatches.jsonl")
-    _first_turn_ctx(env)
-    env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
-    r = _turn(env, "查一下注入", first=False, history=[_user_msg("x")])
-    assert r is not None and "委派提示" in r["context"]
+    env.ctx.llm.scripts = [
+        {"category": "engineering", "expert": "engineering-backend-architect", "confidence": 0.9},
+    ]
+    r = _turn(env, "帮我写个 REST 后端 API", first=True)
+    assert r is not None and "BACKEND-EXPERT-BODY" in r["context"], \
+        "日志故障不得阻断 anchor 注入（_log fail-soft）"
 
 
 def test_expert_path_is_native_absolute(env):
-    """专家资产路径必须是「运行 OS 的原生绝对形态」。
+    """专家资产路径必须是「运行 OS 的原生绝对形态」—— 压缩补注回退全文路径
+    （卡缺失时 _load_expert_context 读 experts/<slug>.md）, 不依赖已删的 hint 卡面。
     - Windows: 盘符绝对路径（junction 可解析, MSYS /c/ 形态会断）→ 断言 C:\\ 或 C:/
     - POSIX: 绝对路径以 / 开头且不含 C: 盘符 → 断言 is_absolute()
 
     按 os.name 自动检测运行平台, 不再硬编码单一 OS（此前 Linux 上必挂:
     env.experts 是 pytest tmp_path, 非 Windows 下无 C: 盘符）。
+    v3.5.1: hint 卡面已删, 不再断言 hint 注入文本含路径字符串; 改走压缩补注
+    回退全文路径验证 _load_expert_context（读 experts/<slug>.md）的活逻辑。
     """
     import os
+    env.cards.joinpath("engineering-backend-architect.md").unlink()  # 强制回退全文路径
     _first_turn_ctx(env)
-    env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
-    r = _turn(env, "查一下注入", first=False, history=[_user_msg("x")])
+    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
+    r = _turn(env, "查一下注入", first=False, history=[_user_msg("[压缩摘要]")])
     ctx_text = r["context"]
-    # 路径字符串必须出现在注入文本里
-    assert str(env.experts / "engineering-security-engineer.md") in ctx_text
+    # 回退全文包装含 '压缩后补注' 标识 + 专家正文（_load_expert_context 读 experts/<slug>.md）
+    assert "压缩后补注" in ctx_text and "BACKEND-EXPERT-BODY" in ctx_text, \
+        "回退全文注入须含专家正文（_load_expert_context 读 experts/<slug>.md 的活逻辑验证）"
     if os.name == "nt":
         # Windows: 必须是盘符绝对路径
         assert "C:\\" in ctx_text or "C:/" in ctx_text, "Windows 下专家路径应为 C:\\ 盘符形态"

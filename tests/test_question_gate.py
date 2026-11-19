@@ -1,4 +1,4 @@
-"""intent-router v3.2 — 问句门退役（TDD suite）。
+"""intent-router v3.2 — 问句门退役（TDD suite）+ v3.5.1 hint 卡面删除后的行为收敛。
 
 Owner 裁决（2026-11-18「全删 regex 不加指令」, 全球化批评）:
 - _QUESTION_RE 中文硬编码表整体删除（不适合全球化: 疑问形态逐语言不同,
@@ -7,7 +7,11 @@ Owner 裁决（2026-11-18「全删 regex 不加指令」, 全球化批评）:
 - 不加替代提示词指令（C 案被否）: 问句消息与普通消息同律, 全量过
   aux 分类 + conf gate（0.7）—— 误判出噪声卡可接受, 低 conf 自然无卡
 - 误杀面修复: 旧门静默跳过的任务型问句（"为什么部署失败"）现在正常分类出卡
-- G1 长度护栏（语言无关）保留: <4 字插话仍静默零 aux
+
+v3.5.1（2026-11-19）删除面: hint 卡面（委派提示卡）+ pre_tool_call 白通道。
+本文件测试用例随之收敛: 常规后续轮（锚点标记可见）不再触发 hint 注入 ——
+v3.5.1 下后续轮唯一注入面 = 压缩补注（reinject, 锚点已设 + 双标记缺失 + 历史非空）;
+问句/常规消息不再进 aux 分类（外层 G1 短消息分类已随 hint 卡面一并删除）。
 """
 import importlib.util
 import json
@@ -110,38 +114,36 @@ def test_no_question_regex_in_module(env):
 
 
 def test_status_question_now_classified(env):
-    """状态问句不再静默: 全量过 aux（C 否案 = 不加指令, 靠 conf gate 自然滤）。"""
+    """v3.5.1: 问句门退役保留（无前置 regex 拦截）; 但 hint 卡面已删 ——
+    锚点标记仍在历史（_anchor 注入的 ctx1 带 <!--ir-expert: 标记）的常规后续轮
+    → 零注入（后续轮唯一注入面 = 压缩补注, 标记可见时不触发）。"""
     ctx1 = _anchor(env)
     env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
-    n_calls = len(env.ctx.llm.calls)
     r = _turn(env, "完成了吗", first=False, history=[_user_msg(ctx1)])
-    assert len(env.ctx.llm.calls) == n_calls + 1, "问句必须过 aux 分类（无前置 regex）"
-    assert r is not None and "委派提示" in r["context"]
+    assert r is None, "锚点标记可见的常规轮必须零注入（hint 卡面已删）"
 
 
 def test_english_question_now_classified(env):
-    """语言中立实证: 英文问句不再被 [？?]$ 特殊拦截, 同律过 aux。"""
+    """语言中立实证: 英文问句不被特殊拦截; v3.5.1 下锚点标记可见轮 → 零注入。"""
     ctx1 = _anchor(env)
     env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
-    n_calls = len(env.ctx.llm.calls)
     r = _turn(env, "did it finish?", first=False, history=[_user_msg(ctx1)])
-    assert len(env.ctx.llm.calls) == n_calls + 1
-    assert r is not None and "委派提示" in r["context"]
+    assert r is None
 
 
 def test_task_question_no_longer_mis_skipped(env):
-    """误杀面修复: 旧门静默跳过的任务型问句（句首'为什么'）现在正常分类出卡。"""
+    """误杀面语义保留: 任务型问句（句首'为什么'）不再被前置 regex 静默跳杀;
+    v3.5.1 下锚点标记可见轮 → 零注入（hint 卡面已删, 不再出委派提示卡）。"""
     ctx1 = _anchor(env)
     env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
-    n_calls = len(env.ctx.llm.calls)
     r = _turn(env, "为什么部署失败", first=False, history=[_user_msg(ctx1)])
-    assert len(env.ctx.llm.calls) == n_calls + 1
-    assert r is not None and "委派提示" in r["context"]
+    assert r is None
+    assert "hint" not in _events(env), "hint 事件必须归零（v3.5.1 卡面已删）"
 
 
 def test_g1_short_message_still_silent(env):
-    """G1 长度护栏（语言无关）保留: <4 字插话仍零 aux 零事件。
-    注: 历史必须带锚点标记（宿主语义）, 否则触发的是合法的压缩补注。"""
+    """G1 长度护栏（语言无关）保留: 短插话（'修' 1 字 < _MIN_SUBSEQ_LEN=4）
+    后续轮静默零事件。注: 历史必须带锚点标记（宿主语义）, 否则触发合法的压缩补注。"""
     ctx1 = _anchor(env)
     n_calls = len(env.ctx.llm.calls)
     r = _turn(env, "修", first=False, history=[_user_msg(ctx1)])
@@ -151,10 +153,9 @@ def test_g1_short_message_still_silent(env):
 
 
 def test_low_conf_message_no_card(env):
-    """无指令替代: 低 conf 消息靠 conf gate 自然不出卡（aux 仍照跑）。"""
+    """v3.5.1: 低 conf 消息不出 hint 卡（hint 卡面已删, 全量无 hint 事件）;
+    锚点标记可见轮 → 零注入（后续轮唯一注入面 = 压缩补注）。"""
     ctx1 = _anchor(env)
     env.ctx.llm.scripts = [{"category": "security", "confidence": 0.3}]
-    n_calls = len(env.ctx.llm.calls)
     r = _turn(env, "还有别的坑吗", first=False, history=[_user_msg(ctx1)])
-    assert len(env.ctx.llm.calls) == n_calls + 1
-    assert r is None, "conf < gate → 无 hint 卡"
+    assert r is None, "conf < gate → 无 hint 卡（v3.5.1 全量无 hint 卡面）"
