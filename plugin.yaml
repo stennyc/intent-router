@@ -10,5 +10,5 @@ config_schema:
     description: 首轮自动锚点注入开关（① 主 agent 是否首轮注入专家）。profile 的 SOUL.md 已含专家 persona（域 profile）时设 false：跳过首轮分类+注入（免重复+免稀释），/expert 手动切换不受影响。
   subagent_inject:
     type: bool
-    default: false
-    description: 按任务把专家注入到子 agent 开关（② 动态配置专家）。true 时子 agent（platform=subagent）的回合复用首轮「分类→命中≥gate→注入专家全文」流水线，按子任务域注入；false（缺省）保持 P0 subagent-guard 全拦（子 agent 零注入，靠 delegate_task.context 自读 experts/<slug>.md）。
+    default: true
+    description: 按任务把专家注入到子 agent 开关（② 动态配置专家）。true（缺省）时子 agent（platform=subagent）的回合复用首轮「分类→命中≥gate→注入专家全文」流水线，按子任务域动态注入（记 subagent-inject）；false 才保持 P0 subagent-guard 全拦（子 agent 零注入，靠 delegate_task.context 自读 experts/<slug>.md）。owner 2026-11-19 拍板缺省放行。

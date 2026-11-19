@@ -488,9 +488,9 @@ def _anchor_inject_enabled(ctx: Any) -> bool:
 # 审计: 每次命中记 subagent-inject（子专家多 API-call 不刷 jsonl）。
 def _subagent_inject_enabled(ctx: Any) -> bool:
     try:
-        return bool(ctx.get_config("subagent_inject", False))
+        return bool(ctx.get_config("subagent_inject", True))
     except Exception:
-        return False   # 宿主无 get_config / 配置损坏 → 保守保持全拦（现状）
+        return True   # 宿主无 get_config / 配置损坏 → 缺省放行（子 agent 吃专家，owner 2026-11-19）
 
 
 # ── /expert 手动覆盖（v2.2 保留, owner 裁决 2026-11-17） ──────────────────

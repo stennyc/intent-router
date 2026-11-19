@@ -300,13 +300,28 @@ def test_log_failure_is_fail_soft(env, monkeypatch):
 
 
 def test_expert_path_is_native_absolute(env):
-    """专家资产在 Windows 上必须是盘符绝对路径（junction 可解析, MSYS /c/ 形态会断）。"""
+    """专家资产路径必须是「运行 OS 的原生绝对形态」。
+    - Windows: 盘符绝对路径（junction 可解析, MSYS /c/ 形态会断）→ 断言 C:\\ 或 C:/
+    - POSIX: 绝对路径以 / 开头且不含 C: 盘符 → 断言 is_absolute()
+
+    按 os.name 自动检测运行平台, 不再硬编码单一 OS（此前 Linux 上必挂:
+    env.experts 是 pytest tmp_path, 非 Windows 下无 C: 盘符）。
+    """
+    import os
     _first_turn_ctx(env)
     env.ctx.llm.scripts = [{"category": "security", "confidence": 0.9}]
     r = _turn(env, "查一下注入", first=False, history=[_user_msg("x")])
     ctx_text = r["context"]
+    # 路径字符串必须出现在注入文本里
     assert str(env.experts / "engineering-security-engineer.md") in ctx_text
-    assert "C:\\" in ctx_text or "C:/" in ctx_text
+    if os.name == "nt":
+        # Windows: 必须是盘符绝对路径
+        assert "C:\\" in ctx_text or "C:/" in ctx_text, "Windows 下专家路径应为 C:\\ 盘符形态"
+    else:
+        # POSIX (Linux/macOS): 必须是绝对路径, 且不得出现 Windows 盘符形态
+        p = Path(str(env.experts / "engineering-security-engineer.md"))
+        assert p.is_absolute(), f"POSIX 下专家路径应为绝对路径: {p}"
+        assert "C:\\" not in ctx_text and "C:/" not in ctx_text, "POSIX 下不应混入 Windows 盘符"
 
 
 def test_no_hardcoded_paths_in_expert_text(env):

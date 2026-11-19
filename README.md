@@ -273,12 +273,13 @@ L2 提醒字节稳定 + skip-running 同轮 + UNKNOWN 静默 / L3 recovered·fai
 
 > **v3.4（2026-11-19）立场更新（owner 裁决）**：上述"子 agent 被注入 = P0 事故"是
 > **v2.5.1 时代的旧定性**。owner 重新定位为「两部分开关」动态专家配置：
-> ① 主 agent 首轮是否注入（`anchor_inject` 开关，保留）；② 按任务把专家注入到**个别
-> 子 agent**（新增 `subagent_inject` 开关，缺省 false）。`subagent_inject=true` 时，
-> 子 agent（platform=subagent）的回合**不再短路**，而是复用首轮「分类→命中≥gate→注入
-> 专家全文」流水线，按子任务域动态注入（命中记 `subagent-inject` 审计事件）；缺省
-> false 维持本节守卫全拦（零行为变化）。即"子 agent 拿专家"从"无条件事故"升级为"可开关
-> 的预期功能"。
+> ① 主 agent 首轮是否注入（`anchor_inject` 开关，保留，缺省 true）；② 按任务把专家
+> 注入到**个别子 agent**（新增 `subagent_inject` 开关，**缺省 true = 缺省放行**，owner
+> 2026-11-19 拍板"子 agent 都吃专家"）。`subagent_inject=true`（缺省）时，子 agent
+> （platform=subagent）的回合**不再短路**，而是复用首轮「分类→命中≥gate→注入
+> 专家全文」流水线，按子任务域动态注入（命中记 `subagent-inject` 审计事件）；显式设
+> `subagent_inject=false` 才维持本节 P0 守卫全拦。即"子 agent 拿专家"从"无条件事故"
+> 升级为"缺省放行、可显式关"的预期功能。
 
 测试：`tests/test_subagent_guard.py`（6 用例：platform/parent 双信号短路 +
 审计节流 + 默认 profile 事故钉死 + 主 session 双零回归）。全量 83 passed

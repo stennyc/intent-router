@@ -115,12 +115,14 @@ _GOAL = "作为 coding 领域专家（stackoverflow-expert）执行以下任务�
 # ── 守卫行为 ────────────────────────────────────────────────────────────────
 
 def test_subagent_turns_short_circuit_platform_signal(env):
-    """platform=subagent → 直接短路: 零分类、零派发、零注入；只记 subagent-guard。"""
+    """subagent_inject=False + platform=subagent → 短路: 零分类/零派发/零注入, 记 subagent-guard。
+    （owner 2026-11-19 翻缺省为 true 后, 此用例显式关开关, 钉死"关=全拦"语义。）"""
+    env.ctx._config["subagent_inject"] = False
     env.ctx.llm.scripts = [
         {"category": "coding", "confidence": 0.9},
     ]
     r = _turn(env, _GOAL, first=True, session_id="sub-1", platform="subagent")
-    assert r is None, f"子 agent 回合不得注入任何东西, got: {r}"
+    assert r is None, f"开关关时子 agent 不得注入, got: {r}"
     assert env.ctx.llm.calls == [], "守卫必须短在 aux 分类之前（不烧分类）"
     assert env.ctx.dispatch_calls == []
     evs = _events(env)
@@ -129,7 +131,8 @@ def test_subagent_turns_short_circuit_platform_signal(env):
 
 
 def test_subagent_turns_short_circuit_parent_signal(env):
-    """parent_session_id 非空（宿主另一信号面）同样触发守卫 —— OR 语义, 单信号即挡。"""
+    """subagent_inject=False + parent_session_id 非空（宿主另一信号面）同样触发守卫 —— OR 语义。"""
+    env.ctx._config["subagent_inject"] = False
     env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
     r = _turn(env, _GOAL, first=True, session_id="sub-2",
               platform="cli", parent_session_id="local-main-1")
@@ -139,7 +142,8 @@ def test_subagent_turns_short_circuit_parent_signal(env):
 
 
 def test_guard_logs_once_per_session(env):
-    """审计节流: 同一子 session 多回合只记一次 subagent-guard（72-API-call 子专家不刷 jsonl）。"""
+    """subagent_inject=False 时审计节流: 同一子 session 多回合只记一次 subagent-guard。"""
+    env.ctx._config["subagent_inject"] = False
     for i in range(3):
         _turn(env, "继续干活", first=(i == 0), session_id="sub-3",
               platform="subagent", history=[{"role": "user", "content": _GOAL}])
@@ -148,19 +152,19 @@ def test_guard_logs_once_per_session(env):
     assert guards[0]["session_id"] == "sub-3"
 
 
-def test_default_profile_subagent_first_turn_no_wrong_expert_injection(env):
-    """事故钉死（owner 指认的"代码侧问题"本体）: 默认 profile（无 get_config →
-    anchor_inject 缺省 true）下, 子 agent 首轮（goal 文本 >10 字）旧码会 aux 分类 +
-    注入错误专家全文 + 设子 session 锚点 → 后续轮孙代级联。守卫后全灭。"""
+def test_subagent_inject_off_no_injection(env):
+    """subagent_inject=False（显式关）→ 子 agent 零注入, 记 subagent-guard。
+    覆盖"缺省 P0 事故钉死"的本体（旧 test_default_profile_...no_wrong_expert_injection）。"""
+    env.ctx._config["subagent_inject"] = False
     env.ctx.llm.scripts = [
         {"category": "engineering", "confidence": 0.9},   # 子 agent 自己的 goal 文本被分类
     ]
     r = _turn(env, _GOAL, first=True, session_id="sub-4", platform="subagent")
     assert r is None
     assert "BACKEND-EXPERT-BODY" not in json.dumps(r or {}, ensure_ascii=False)
-    assert env.ctx.llm.calls == [], "守卫后子 agent 回合不烧 aux 分类"
+    assert env.ctx.llm.calls == [], "开关关时子 agent 回合不烧 aux 分类"
     evs = _events(env)
-    assert not [e for e in evs if e["event"] == "anchor"], "不得给子 agent 设锚点"
+    assert not [e for e in evs if e["event"] == "anchor"], "开关关时不得给子 agent 设锚点"
     assert not [e for e in evs if e["event"] in ("dispatch", "lifecycle-absent")], evs
     st = env.mod._SESSIONS.get("sub-4")
     assert st is None or st.anchor is None
@@ -190,10 +194,23 @@ def test_expert_command_still_works_on_main_session(env):
 
 
 # ── subagent_inject 开关（v3.4, owner 裁决 2026-11-19: "两部分注入"②） ───────
+# owner 2026-11-19 拍板: 缺省翻为 true（缺省放行, 子 agent 都吃专家）; 关=False 才拦。
 
-def test_subagent_inject_off_keeps_guard_default(env):
-    """subagent_inject 缺省（False）= 现状 P0 守卫全拦: 子 agent 零注入。
-    （_FakeCtx.get_config 返回默认 None→bool=False，等价宿主未配置。）"""
+def test_subagent_inject_default_on_injects_expert(env):
+    """缺省（无 get_config → subagent_inject 缺省 True）= 放行: 子 agent 按任务域注入专家。
+    这是 owner 2026-11-19 拍板的默认行为（子 agent 都吃专家）。"""
+    env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
+    r = _turn(env, _GOAL, first=True, session_id="sub-def", platform="subagent")
+    assert r is not None, "缺省放行时子 agent 应注入专家上下文"
+    assert "BACKEND-EXPERT-BODY" in r["context"]
+    evs = _events(env)
+    assert [e for e in evs if e["event"] == "subagent-inject"], evs
+    assert not [e for e in evs if e["event"] == "subagent-guard"], evs
+
+
+def test_subagent_inject_explicit_off_keeps_guard(env):
+    """subagent_inject=False（显式关）= 现状 P0 守卫全拦: 子 agent 零注入。"""
+    env.ctx._config["subagent_inject"] = False
     env.ctx.llm.scripts = [{"category": "engineering", "confidence": 0.9}]
     r = _turn(env, _GOAL, first=True, session_id="sub-off", platform="subagent")
     assert r is None, "开关关时必须全拦"

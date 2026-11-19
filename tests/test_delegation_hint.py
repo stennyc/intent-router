@@ -320,7 +320,8 @@ def test_completion_reentry_turn_skips_detection(env):
 # ── P0 子 session 守卫回归 ──────────────────────────────────────────────────
 
 def test_subagent_guard_still_short_circuits(env):
-    """子 agent session（模型 delegate_task 拉起的）回合仍被守卫短路。"""
+    """subagent_inject=False（显式关, owner 2026-11-19 缺省翻 true 后）→ 子 agent 回合仍被守卫短路。"""
+    env.ctx.settings["subagent_inject"] = False
     env.ctx.llm.scripts = [{"category": "coding", "confidence": 0.9}]
     r = _turn(env, "作为 coding 领域专家执行以下任务", first=True,
               session_id="sub-1", platform="subagent")
