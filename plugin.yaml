@@ -1,0 +1,5 @@
+name: intent-router
+version: "1.0.0"
+description: 动态专家上下文路由 — 根据用户意图自动加载对应领域专家技能
+author: hermes-agent
+license: MIT
