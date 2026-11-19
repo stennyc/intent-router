@@ -52,7 +52,7 @@ CATEGORY_MAP = {
     "code-review": "engineering-code-reviewer",
     "data": "engineering-data-engineer",
     "data-analysis": "support-analytics-reporter",  # 统计分析、数据洞察
-    "statistics": "support-analytics-reporter",     # 统计学、假设检验、回归分析
+    "statistics": "statistician",                   # 假设检验、回归分析、实验设计（本地 expert 为准）
     "devops": "engineering-devops-automator",
     # 设计类
     "design": "design-ui-designer",
@@ -342,33 +342,38 @@ def _hint_visible(st: _SessionState, conversation_history: Any) -> bool:
 
 
 def _hint_card(slug: str, category: str, confidence: float, user_message: str) -> str:
-    """v3.3 绑定式委派提示卡（owner 裁决 2026-11-18: 治「委派了但模板没被采用」——
-    活体实证 8497e1: 模型自写 goal 丢了专家形态, 子专家从未读专家文件）:
-    - 口吻从建议式升为**绑定式**: 原样采用 goal/context 两字段, 勿改写/勿删减
-    - 调度纪律: 一次只委派一个任务, 勿创建占位/备用子 agent（实证 7ad9c4）
-    - goal 明写 F3 边界: 勿重做主进程已在做的工作（治「各做各的」）
-    - v3.3.1（reviewer 复盘 L1/L2）: 指令句（纪律/自动重入）前移至数据块之前;
-      数据块显式参数化为 delegate_task(tasks=[{...}]) 帧, 数据/指令边界可辨,
-      模型照抄数据块不会把指令句扫进子 agent context
+    """v3.3 绑定式委派提示卡 + v3.3.2 强化（复制粘贴口吻 + ```json 围栏 + goal/context 局部变量提取）:
+    - v3.3 口吻: 绑定式, 原样采用 goal/context 两字段, 勿改写/勿删减
+    - v3.3.1: 指令句前移 + 数据块显式参数化为 delegate_task(tasks=[{...}]) 帧
+    - v3.3.2（本次）:
+      * 口吻从「请原样采用」升为「**复制粘贴**下面调用体（勿改写任何字段）」——降低 LLM 自写概率
+      * 数据块加 ```json 围栏——fenced code block 照抄率高于裸文本
+      * goal/context 提取为函数内局部变量 goal_text / context_text——代码可读性, 行为不变
+    - 调度纪律: 一次只委派一个任务, 勿创建占位/备用/no-op 子 agent
+    - goal 明写 F3 边界: 勿重做主进程已在做的工作
     append-only 尾部加法, 缓存安全。"""
     expert_path = _EXPERTS_DIR / f"{slug}.md"
     task = _task_label(user_message)
+    goal_text = (f"作为 {category} 领域专家（{slug}）执行以下任务: {task}。"
+                 f"只交付 findings/结果, 勿重做主进程已在做的工作")
+    context_text = (f"1) 先读专家文件 {expert_path}（file 工具; 若文件不存在则在结果中说明, "
+                    f"勿从网络拉取）; 2) 动手前自取持久上下文: 用 filemem_search 与 kb_search_central "
+                    f"查与本任务相关的 {category} 域事实; 3) 只交付 findings, 不做 git commit/push"
+                    f"（git 归主进程）")
     return (
         f"## 委派提示（新域: {category}）\n"
         f"检测到新领域 {category}（专家 slug={slug}, conf={confidence}）。\n"
         f"纪律: 一次只委派一个任务——勿创建占位/备用/no-op 子 agent。\n"
         f"结果由宿主自动重入（无需轮询）; 不委派则主进程直接自答亦可。\n"
-        f"如委派, 请**原样采用**下面参数块（勿改写 goal、勿删减 context）:\n"
+        f"如委派, **复制粘贴**下面调用体（勿改写任何字段）:\n"
+        f"```json\n"
         f"delegate_task(tasks=[\n"
         f"  {{\n"
-        f'    "goal": "作为 {category} 领域专家（{slug}）执行以下任务: {task}。'
-        f'只交付 findings/结果, 勿重做主进程已在做的工作",\n'
-        f'    "context": "1) 先读专家文件 {expert_path}（file 工具; 若文件不存在则在结果中说明, '
-        f'勿从网络拉取）; 2) 动手前自取持久上下文: 用 filemem_search 与 kb_search_central '
-        f'查与本任务相关的 {category} 域事实; 3) 只交付 findings, 不做 git commit/push'
-        f'（git 归主进程）"\n'
+        f'    "goal": "{goal_text}",\n'
+        f'    "context": "{context_text}"\n'
         f"  }}\n"
         f"])\n"
+        f"```\n"
         f"{_HINT_MARKER_FMT.format(slug)}"
     )
 

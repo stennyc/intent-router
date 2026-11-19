@@ -129,11 +129,11 @@ def test_new_domain_injects_hint_card(env):
 
 
 def test_hint_card_binding_not_advisory(env):
-    """v3.3 绑定口吻: 卡指令'原样采用' goal/context 字段, 且旧的弱化建议语（'仅为可选建议'）移除。
-    实证（2026-11-18 8497e1）: 模型自写 goal 丢了专家形态——卡片建议口吻塑形失败的直接后果。"""
+    """v3.3 绑定口吻: 卡指令模型采用模板, 旧弱化建议语（'仅为可选建议'）移除。
+    v3.3.2 口吻升级为'复制粘贴'。"""
     r, _h = _anchor_and_new_domain(env)
     ctx_text = r["context"]
-    assert "原样" in ctx_text, "绑定语: 指示模型原样使用模板"
+    assert "复制粘贴" in ctx_text, "v3.3.2 绑定语: 指示模型复制粘贴调用体"
     assert "可选建议" not in ctx_text, "弱化建议口吻必须移除"
 
 
@@ -169,14 +169,15 @@ def test_hint_card_directives_before_data(env):
 
 def test_hint_card_explicit_argument_block(env):
     """v3.3.1 L2: 数据块显式 JSON 化为 delegate_task(tasks=[{...}]) 参数块——
-    data/directive 边界可辨, 且模型可直接粘贴整块作为调用参数。"""
+    data/directive 边界可辨, 且模型可直接粘贴整块作为调用参数。
+    v3.3.2: 参数块外加 ```json 围栏。"""
     r, _h = _anchor_and_new_domain(env)
     ctx_text = r["context"]
     assert "delegate_task(tasks=[" in ctx_text, "数据块须显式参数化帧"
     assert '"goal":' in ctx_text and '"context":' in ctx_text, "JSON 式字段键"
     assert ctx_text.rstrip().endswith(
-        "])\n" + _HINT_MARKER_PREFIX + "engineering-security-engineer-->"), \
-        "参数块闭合后跟审计标记行"
+        "])\n```\n" + _HINT_MARKER_PREFIX + "engineering-security-engineer-->"), \
+        "参数块闭合 + ```json 围栏关闭 + 审计标记行"
 
 
 def test_no_advisory_wording_in_module_source(env):
@@ -184,6 +185,33 @@ def test_no_advisory_wording_in_module_source(env):
     （含 docstring）——README 历史节与测试用例为有意留存, 不在此面。"""
     src = Path(__file__).resolve().parents[1] / "__init__.py"
     assert "可选建议" not in src.read_text(encoding="utf-8")
+
+
+# ── v3.3.2 强化面 ──────────────────────────────────────────────────────────
+
+def test_hint_card_json_fence(env):
+    """v3.3.2: 数据块外加 ```json 围栏（fenced code block 照抄率高于裸文本）。"""
+    r, _h = _anchor_and_new_domain(env)
+    ctx_text = r["context"]
+    assert "```json" in ctx_text, "须有 ```json 开围栏"
+    assert "```" in ctx_text.split("```json")[-1], "须有 ``` 闭围栏"
+
+
+def test_hint_card_copy_paste_tone(env):
+    """v3.3.2: 口吻从'原样采用'升为'复制粘贴'（降低 LLM 自写概率）。"""
+    r, _h = _anchor_and_new_domain(env)
+    ctx_text = r["context"]
+    assert "复制粘贴" in ctx_text, "v3.3.2 绑定语须为复制粘贴"
+    assert "勿改写任何字段" in ctx_text, "复制粘贴口吻须带勿改写约束"
+
+
+def test_hint_card_goal_context_local_vars(env):
+    """v3.3.2: goal/context 提取为函数内局部变量（代码可读性, 行为不变）。"""
+    import inspect
+    mod = env.mod
+    src = inspect.getsource(mod._hint_card)
+    assert "goal_text" in src, "goal 须提取为局部变量 goal_text"
+    assert "context_text" in src, "context 须提取为局部变量 context_text"
 
 
 def test_hint_idempotent_per_domain(env):
